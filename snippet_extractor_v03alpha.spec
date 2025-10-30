@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['snippet_extracor_v03alpha.py'],
+    ['snippet_extractor_v03alpha.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -36,3 +36,4 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+
