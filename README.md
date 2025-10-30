@@ -2,7 +2,7 @@
 Buzzword search with "AND" option within distance. Its like an embedder only with plain txt search!
 The maximum text found is never larger than the original text, as overlapping sections are merged!<br>
 -> all is in character and percent<br>
--> keep in mind 5000characters ~1200token
+-> keep in mind 5000characters ~1200token (aprox one book page)
 
 EXE on huggingface:<br>
 https://huggingface.co/kalle07/raw-txt-snippet-creator
