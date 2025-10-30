@@ -1,6 +1,8 @@
 # raw-txt-snippet-creator
 Buzzword search with "AND" option within distance. Its like an embedder only with plain txt search!
 The maximum text found is never larger than the original text, as overlapping sections are merged!
+-> all is in character and percent
+-> keep in mind 5000characters ~1200token
 
 # Hints
 * Only windows tested!
