@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 # Define the entry point (your main script)
-entry_point = "snippet_extracor_v03alpha.py"
+entry_point = "snippet_extractor_v03alpha.py"
 
 # Build command with PyInstaller arguments
 cmd = [
@@ -40,3 +40,4 @@ except subprocess.CalledProcessError as e:
     
 except FileNotFoundError:
     print("PyInstaller not found. Please install it with 'pip install pyinstaller'")
+
