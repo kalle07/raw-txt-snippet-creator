@@ -2,7 +2,7 @@
 Buzzword search with "AND" option within distance. Its like an embedder only with plain txt search!
 The maximum text found is never larger than the original text, as overlapping sections are merged!
 
-# comming soon
+# Hints
 * Only windows tested!
 * Only txt files
 * Choose one txt file or a whole folder
