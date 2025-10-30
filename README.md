@@ -1,5 +1,6 @@
 # raw-txt-snippet-creator
-Buzzword search with "and" option within distance. Its like an embedder only with plain txt search
+Buzzword search with "AND" option within distance. Its like an embedder only with plain txt search!
+The maximum text found is never larger than the original text, as overlapping sections are merged!
 
 # comming soon
 * Only windows tested!
@@ -9,7 +10,10 @@ Buzzword search with "and" option within distance. Its like an embedder only wit
 * All matches found are cut out as a snippet.
 * All overlaped snippets ar merged
 * Two search options "usual wildcard" and "fuzzy-search"
-* all snippets append and will be saved (one for wildcard one for fuzzy)
+(wildcard search If you have the word “friendship” and search for “friend” it will not be found. You should use “friend*”. "?" is only one character like usual.)
+(fuzzy is sometime usefully , but it dont work with any punctuation like ip adresses, but it can handle in some cases * and ?)
+* All snippets are appended and saved (one for wildcard one for fuzzy) in json format with te match and found position
+* Output files are always overwritten when you click “Search” again.
 * Now you can easily copy and paste to your chat
 
 
