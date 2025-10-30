@@ -4,6 +4,9 @@ The maximum text found is never larger than the original text, as overlapping se
 -> all is in character and percent<br>
 -> keep in mind 5000characters ~1200token
 
+EXE on huggingface:<br>
+https://huggingface.co/kalle07/raw-txt-snippet-creator
+
 # Hints
 * Only windows tested!
 * Only txt files
