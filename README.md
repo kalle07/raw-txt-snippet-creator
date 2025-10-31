@@ -9,7 +9,7 @@ https://huggingface.co/kalle07/raw-txt-snippet-creator
 
 # Hints
 * Only windows tested!
-* Only txt files, tested with 2MB (one large book)
+* Only txt files, tested with 2MB (one large book) ~10-20sec
 * Choose one txt file or a whole folder
 * Type a buzzword or more, with AND its connected with in a distance
 * All matches found are cut out as a snippet
