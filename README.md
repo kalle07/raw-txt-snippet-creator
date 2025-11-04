@@ -1,4 +1,5 @@
 # raw-txt-snippet-creator
+Actual version: v04alpha<br>
 Buzzword search with "AND" option within distance. Its like an embedder only with plain txt search!
 The maximum text found is never larger than the original text, as overlapping sections are merged!<br>
 -> all is in character and percent<br>
