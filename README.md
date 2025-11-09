@@ -1,6 +1,7 @@
 # raw-txt-snippet-creator
 Actual version: v04alpha<br>
-Buzzword search with "AND" option within distance. Its like an embedder only with plain txt search!
+Buzzword search with "AND" option within distance. Its like an embedder only with plain txt search!<br>
+It's like opening a text editor, searching for a keyword, and finding X hits. Now the snippet extractor cuts out a section around each keyword.
 The maximum text found is never larger than the original text, as overlapping sections are merged!<br>
 -> all is in character and percent<br>
 -> keep in mind 5000characters ~1200token (aprox one book page)
@@ -12,8 +13,8 @@ https://huggingface.co/kalle07/raw-txt-snippet-creator
 * Only windows tested!
 * Only txt files, tested with 2MB (one large book) ~10-20sec
 * Choose one txt file or a whole folder
-* Type a buzzword or more, with AND its connected with in a distance
-* All matches found are cut out as a snippet
+* Type a buzzword or more, only with AND (second search field) its connected with in a "distance option"
+* All matches found are cut out as a snippet (in % 0.3 before and 0.7 after the keyword)
 * All overlaped snippets ar merged
 * Two search options "usual wildcard" and "fuzzy-search"<br>
 (wildcard search If you have the word “friendship” and search for “friend” it will not be found. You should use “friend*”. "?" is only one character like usual.)<br>
