@@ -19,9 +19,10 @@ https://huggingface.co/kalle07/raw-txt-snippet-creator
 * All overlaped snippets ar merged
 * Two search options "usual exact + wildcard" and "fuzzy-search"<br>
 (wildcard search If you have the word “friendship” and search for “friend” it will not be found. You should use “friend*”. "?" is only one character like usual.)<br>
-(fuzzy is sometime usefully , but it dont work with any punctuation like ip adresses, but it can handle in some cases * and ?)
+(fuzzy is sometime usefully , but it dont work with any punctuation like ip adresses, but it can handle in some cases * and ?, in % I would not specify less than 80.)
 * All snippets are appended and saved (one for wildcard one for fuzzy - file) in json format with te match and found position<br>
 (the position you can see eg: in notepad++)
+* first line also shows sum of all characters and estimated token
 * Output files are always overwritten when you click “Search” again
 * Now you can easily copy and paste to your chat
 
