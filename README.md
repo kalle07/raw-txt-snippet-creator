@@ -27,4 +27,4 @@ https://huggingface.co/kalle07/raw-txt-snippet-creator
 * Now you can easily copy and paste to your chat
 
 
-<img width="1557" height="1241" alt="grafik" src="https://github.com/user-attachments/assets/b8a6fff9-01f4-4b40-893d-7a34d6e7ca11" />
+<img width="1557" height="1241" alt="grafik" src="https://github.com/user-attachments/assets/213f45e5-2219-48c9-bd49-b506d9199e5c" />
