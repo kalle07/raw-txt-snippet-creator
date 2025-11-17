@@ -13,7 +13,7 @@ https://huggingface.co/kalle07/raw-txt-snippet-creator
 * Only windows tested!
 * Only txt files, tested with 2MB (one large book) ~10-20sec
 * Choose one txt file or a whole folder
-* Type a buzzword or more, only with AND (second search field) its connected with in a "distance option"
+* Type one buzzword or more, only with AND (second search field) its connected with in a "distance option"
 * snippet size and distance all in characters (5000 chars ~one book page, ~1400token)
 * All matches found are cut out as a snippet (in % 0.3 before and 0.7 after the keyword)
 * All overlaped snippets ar merged
