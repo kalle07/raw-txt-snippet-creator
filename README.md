@@ -6,7 +6,7 @@ The maximum text found is never larger than the original text, as overlapping se
 -> all is in character and percent<br>
 -> keep in mind 5000characters ~1200token (aprox one book page)
 
-EXE on huggingface or relases(left side):<br>
+EXE on huggingface or relases(right side):<br>
 https://huggingface.co/kalle07/raw-txt-snippet-creator
 
 # Hints
