@@ -1,5 +1,5 @@
 # raw-txt-snippet-creator
-Actual version: v04alpha<br>
+Actual version: v08alpha<br>
 Buzzword search with "AND" option within distance. Its like an embedder only with plain txt search!<br>
 It's like opening a text editor, searching for a keyword, and finding X hits. Now the snippet extractor cuts out a section around each keyword and save.
 The maximum text found is never larger than the original text, as overlapping sections are merged!<br>
