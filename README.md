@@ -3,8 +3,9 @@ Actual version: v08alpha<br>
 Buzzword search with "AND" option within distance. Its like an embedder only with plain txt search!<br>
 It's like opening a text editor, searching for a keyword, and finding X hits. Now the snippet extractor cuts out a section around each keyword and save.
 The maximum text found is never larger than the original text, as overlapping sections are merged!<br>
--> all is in character and percent<br>
--> keep in mind 5000characters ~1200token (aprox one book page)
+-> All is in character and percent<br>
+-> Keep in mind 5000characters ~1200token (aprox one book page)
+-> If you are searching for the phrase "blue care", please note that this part will not be found if there is a line break between the two words. 
 
 EXE on huggingface or relases(right side):<br>
 https://huggingface.co/kalle07/raw-txt-snippet-creator
@@ -20,7 +21,7 @@ https://huggingface.co/kalle07/raw-txt-snippet-creator
 * Two search options "usual exact + wildcard" and "fuzzy-search"<br>
 (wildcard search If you have the word “friendship” and search for “friend” it will not be found. You should use “friend*”. "?" is only one character like usual.)<br>
 (fuzzy is sometime usefully , but it dont work with any punctuation like ip adresses, but it can handle in some cases * and ?, in % I would not specify less than 80.)
-* All snippets are appended and saved (one for wildcard one for fuzzy - file) in json format with te match and found position<br>
+* All snippets are appended and saved (one for wildcard one for fuzzy - file) in json format with all snippets and found position (This file is overwritten with every search)<br>
 (the position you can see eg: in notepad++)
 * first line also shows sum of all characters and estimated token
 * Output files are always overwritten when you click “Search” again
