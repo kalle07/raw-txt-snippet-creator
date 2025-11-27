@@ -31,3 +31,6 @@ https://huggingface.co/kalle07/raw-txt-snippet-creator
 
 
 <img width="1557" height="1241" alt="grafik" src="https://github.com/user-attachments/assets/213f45e5-2219-48c9-bd49-b506d9199e5c" />
+<br>
+<br>
+I am not responsible for any errors or crashes on your system. If you use it, you take full responsibility!
