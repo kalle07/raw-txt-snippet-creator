@@ -5,7 +5,7 @@ It's like opening a text editor, searching for a keyword, and finding X hits. No
 The maximum text found is never larger than the original text, as overlapping sections are merged!<br>
 -> All is in character and percent<br>
 -> Keep in mind 5000characters ~1200token (aprox one book page)
--> If you are searching for the phrase "blue care", please note that this part will not be found if there is a line break between the two words. 
+-> If you are searching for the phrase "blue care", please note that this part will not be found if there is a line break between the two words.<br> 
 Best in combination with my PDF Parser:
 https://github.com/kalle07/parsing
 
