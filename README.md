@@ -6,6 +6,8 @@ The maximum text found is never larger than the original text, as overlapping se
 -> All is in character and percent<br>
 -> Keep in mind 5000characters ~1200token (aprox one book page)
 -> If you are searching for the phrase "blue care", please note that this part will not be found if there is a line break between the two words. 
+Best in combination with my PDF Parser:
+https://github.com/kalle07/parsing
 
 EXE on huggingface or relases(right side):<br>
 https://huggingface.co/kalle07/raw-txt-snippet-creator
