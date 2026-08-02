@@ -32,5 +32,10 @@ https://huggingface.co/kalle07/raw-txt-snippet-creator
 
 <img width="1557" height="1241" alt="grafik" src="https://github.com/user-attachments/assets/213f45e5-2219-48c9-bd49-b506d9199e5c" />
 <br>
+
+
+[![GitHub Downloads (latest)](https://img.shields.io/github/downloads/kalle07/idle-shutdown-timer/latest?label=latest%20release%20downloads&color=green)](https://github.com/kalle07/idle-shutdown-timer/releases/latest)
+
+
 <br>
 I am not responsible for any errors or crashes on your system. If you use it, you take full responsibility!
