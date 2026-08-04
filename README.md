@@ -34,7 +34,9 @@ https://huggingface.co/kalle07/raw-txt-snippet-creator
 <br>
 
 
-[![GitHub Downloads (latest)](https://img.shields.io/github/downloads/kalle07/idle-shutdown-timer/latest?label=latest%20release%20downloads&color=green)](https://github.com/kalle07/idle-shutdown-timer/releases/latest)
+📥 Downloads: <!--download-count-->000<!--/download-count-->
+<br>
+<br>
 
 
 <br>
