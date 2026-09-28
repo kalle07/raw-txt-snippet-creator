@@ -1,36 +1,33 @@
-# raw-txt-snippet-creator
-Actual version: v08alpha<br>
-Buzzword search with "AND" option within distance. Its like an embedder only with plain txt search!<br>
-It's like opening a text editor, searching for a keyword, and finding X hits. Now the snippet extractor cuts out a section around each keyword and save.
+# raw-txt-snippet-creator with database
+Actual version: 09-beta<br>
+up to 3 keywords linked by <b>and</b>. Its like an embedder only with plain txt search!<br>
+It's like opening a text editor, searching for a keyword, and finding X hits. Now the snippet extractor cuts out a section around each keyword and show it.
 The maximum text found is never larger than the original text, as overlapping sections are merged!<br>
--> All is in character and percent<br>
+-> All is in characters<br>
 -> Keep in mind 5000characters ~1200token (aprox one book page)
--> If you are searching for the phrase "blue care", please note that this part will not be found if there is a line break between the two words.<br> 
-Best in combination with my PDF Parser:
-https://github.com/kalle07/parsing
+-> can handle large amount of data
+-> will be indexed first
+-> usual search need <100ms
+- phrase search function will be implemented shortly.
+- case-sensitive function will be implemented shortly.
 
-EXE on huggingface or relases(right side):<br>
-https://huggingface.co/kalle07/raw-txt-snippet-creator
+Best in combination with my PDF Parser:
+https://github.com/kalle07/pdf2txt-parser
 
 # Hints
 * Only windows tested!
-* Only txt files, tested with 2MB (one large book) ~10-20sec
-* Choose one txt file or a whole folder
-* Type one buzzword or more, only with AND (second search field) its connected with in a "distance option"
-* snippet size and distance all in characters (5000 chars ~one book page, ~1400token)
-* All matches found are cut out as a snippet (in % 0.3 before and 0.7 after the keyword)
-* All overlaped snippets ar merged
+* Only txt files, tested with several 2MB (several large books)
+* Choose txt file or copy all txt files into sup folder "txt"
+* Type one keyword or more
+* Max_Distance_Chars - is the max distance between the keywords in characters
+* Snippet_Conext_Chars - number of characters before and after the last word found
 * Two search options "usual exact + wildcard" and "fuzzy-search"<br>
 (wildcard search If you have the word “friendship” and search for “friend” it will not be found. You should use “friend*”. "?" is only one character like usual.)<br>
-(fuzzy is sometime usefully , but it dont work with any punctuation like ip adresses, but it can handle in some cases * and ?, in % I would not specify less than 80.)
-* All snippets are appended and saved (one for wildcard one for fuzzy - file) in json format with all snippets and found position (This file is overwritten with every search)<br>
-(the position you can see eg: in notepad++)
-* first line also shows sum of all characters and estimated token
-* Output files are always overwritten when you click “Search” again
+(fuzzy is sometime usefully , "1" means one characater replacement -> small typos / minor variations; fuzzy 2 most times found a lot of words)
 * Now you can easily copy and paste to your chat
 
 
-<img width="1557" height="1241" alt="grafik" src="https://github.com/user-attachments/assets/213f45e5-2219-48c9-bd49-b506d9199e5c" />
+<img width="1482" height="1054" alt="grafik" src="https://github.com/user-attachments/assets/9a90f8d7-acc6-4bcd-b8b1-8a4f15ccfe56" />
 <br>
 <br>
 
