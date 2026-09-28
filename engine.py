@@ -24,7 +24,8 @@ VOCABULARY
 
 POSTINGS
     One row per ``(doc_id, term_id)``.  ``positions`` is a flat Arrow
-    ``list<int32>`` containing ``[start1, end1, start2, end2, ...]``.
+    ``list<int32>`` containing ``[start1, length1, start2, length2, ...]``.
+    End offsets are reconstructed as ``start + vocabulary.token_length``.
 
 TERM_FREQUENCIES
     One row per ``(doc_id, term_id)`` with only the occurrence count.  This
@@ -39,8 +40,8 @@ FTS_TOKENS
 The search pipeline is deliberately a funnel:
     Tantivy candidate docs
         -> candidate term/variant resolution
-        -> lightweight frequencies
-        -> numeric positional postings
+        -> lightweight frequencies from LanceDB
+        -> numeric positional postings from LanceDB
         -> NumPy proximity engine
         -> result documents
 """
@@ -116,7 +117,8 @@ TOKEN_PATTERN = re.compile(r"\b[\wÄÖÜäöüß]+\b", re.UNICODE)
 # -----------------------------------------------------------------------------
 
 DOCS_TABLE = "docs"
-POSTINGS_TABLE = "postings"
+POSTINGS_TABLE = "postings_v2"
+LEGACY_POSTINGS_TABLES = ("postings",)
 VOCABULARY_TABLE = "vocabulary"
 FREQUENCIES_TABLE = "term_frequencies"
 
@@ -126,6 +128,7 @@ DOCS_SCHEMA = pa.schema(
         pa.field("path", pa.string()),
         pa.field("sha256", pa.string()),
         pa.field("content", pa.string()),
+        pa.field("word_count", pa.int64()),
     ]
 )
 
@@ -141,6 +144,7 @@ POSTINGS_SCHEMA = pa.schema(
     [
         pa.field("doc_id", pa.int64()),
         pa.field("term_id", pa.int32()),
+        # Flat pairs of (start, length).  End is always start + vocabulary length.
         pa.field("positions", pa.list_(pa.int32())),
     ]
 )
@@ -149,7 +153,6 @@ FREQUENCIES_SCHEMA = pa.schema(
     [
         pa.field("doc_id", pa.int64()),
         pa.field("term_id", pa.int32()),
-        pa.field("token_length", pa.int64()),
         pa.field("occurrence_count", pa.int64()),
     ]
 )
@@ -681,6 +684,7 @@ def document_row(doc_id: int, path: Path, content: str, sha256: str) -> dict:
         "path": str(path.absolute()),
         "sha256": sha256,
         "content": content,
+        "word_count": int(count_words(content)),
     }
 
 
@@ -718,7 +722,7 @@ def build_postings_for_document(doc_id: int, content: str, term_to_id: dict[str,
 
     for token, start, end in iter_tokens(content):
         term_id = term_to_id[token]
-        spans_by_term.setdefault(term_id, []).extend((int(start), int(end)))
+        spans_by_term.setdefault(term_id, []).extend((int(start), int(end - start)))
 
     rows: list[dict] = []
     for term_id, flat_positions in sorted(spans_by_term.items()):
@@ -733,15 +737,11 @@ def build_postings_for_document(doc_id: int, content: str, term_to_id: dict[str,
     return rows
 
 
-def frequency_rows_from_postings(
-    postings: Sequence[dict],
-    term_lengths: dict[int, int],
-) -> list[dict]:
+def frequency_rows_from_postings(postings: Sequence[dict]) -> list[dict]:
     return [
         {
             "doc_id": int(row["doc_id"]),
             "term_id": int(row["term_id"]),
-            "token_length": int(term_lengths[int(row["term_id"])]),
             "occurrence_count": int(len(row["positions"]) // 2),
         }
         for row in postings
@@ -1125,38 +1125,6 @@ def resolve_regex_variants(
     }, detail
 
 
-def fetch_candidate_terms_once(
-    index: "SearchIndex",
-    candidate_docs: set[int],
-    lower: int,
-    upper: int,
-    report: SearchReport | None = None,
-) -> tuple[list[tuple[int, int]], int]:
-    """Enumerate fuzzy candidate terms from the in-memory document term cache.
-
-    Tantivy remains responsible for reducing the corpus to candidate documents.
-    The static runtime cache then supplies the terms present in those documents,
-    avoiding a large frequency-table query before RapidFuzz.
-    """
-
-    if not candidate_docs:
-        return [], 0
-
-    candidate_term_ids: set[int] = set()
-    for doc_id in candidate_docs:
-        candidate_term_ids.update(index.doc_term_ids.get(int(doc_id), ()))
-
-    candidates = [
-        (int(term_id), int(index.term_lengths[int(term_id)]))
-        for term_id in candidate_term_ids
-        if lower <= int(index.term_lengths[int(term_id)]) <= upper
-    ]
-    candidates.sort()
-    if report is not None:
-        report.runtime_candidate_terms = len(candidates)
-    return candidates, len(candidates)
-
-
 def resolve_fuzzy_variants_from_candidate_terms(
     index: "SearchIndex",
     query_terms: list[str],
@@ -1164,114 +1132,35 @@ def resolve_fuzzy_variants_from_candidate_terms(
     config: SearchConfig,
     report: SearchReport,
 ) -> list[dict[int, int]]:
-    """Resolve all fuzzy keywords from the static in-memory candidate-term cache.
+    """Resolve fuzzy variants from the in-memory vocabulary, without postings caches.
 
-    Pipeline:
-        1. Compute one combined token-length range for all fuzzy keywords.
-        2. Enumerate terms present in the Tantivy candidate documents from RAM.
-        3. Group/filter candidates by token length in memory.
-        4. Run RapidFuzz.
+    FTS has already reduced the corpus to candidate documents. The vocabulary is
+    small enough to keep in RAM, so fuzzy matching can use it directly without
+    constructing a document-term cache from the entire postings table.
     """
 
-    variants_by_term: list[dict[int, int] | None] = [None] * len(query_terms)
-    resolution_entries: list[dict | None] = [None] * len(query_terms)
+    del candidate_docs  # FTS candidates are applied later by frequency planning.
+    variants_by_term: list[dict[int, int]] = []
     started_total = time.perf_counter()
 
-    normalized_queries: list[tuple[int, str, str, int, int]] = []
-    for position, query_term in enumerate(query_terms):
-        query = query_term.strip().casefold()
-        if not query or "*" in query or "?" in query:
-            # Fuzzy mode does not support wildcard syntax; preserve the existing
-            # behavior that causes the overall search to return no results.
-            variants_by_term[position] = {}
-            resolution_entries[position] = {
+    for query_term in query_terms:
+        started = time.perf_counter()
+        variants, mode_detail = resolve_variants(index, query_term, "fuzzy", config)
+        variants_by_term.append(variants)
+        report.variant_resolution.append(
+            {
                 "query_term": query_term,
-                "variants": 0,
-                "time_ms": 0.0,
-                "mode_detail": "fuzzy mode rejects wildcard syntax",
+                "variants": len(variants),
+                "time_ms": (time.perf_counter() - started) * 1000.0,
+                "mode_detail": mode_detail,
             }
-            continue
-
-        lower = max(0, len(query) - config.fuzzy_distance)
-        upper = len(query) + config.fuzzy_distance
-        normalized_queries.append((position, query_term, query, lower, upper))
-
-    if not normalized_queries:
-        report.variant_resolution_ms = (time.perf_counter() - started_total) * 1000.0
-        report.variant_resolution.extend(
-            entry for entry in resolution_entries if entry is not None
         )
-        return [variants or {} for variants in variants_by_term]
 
-    combined_lower = min(item[3] for item in normalized_queries)
-    combined_upper = max(item[4] for item in normalized_queries)
-    report.variant_candidate_min_length = combined_lower
-    report.variant_candidate_max_length = combined_upper
-
-    candidate_query_started = time.perf_counter()
-    candidate_rows, raw_row_count = fetch_candidate_terms_once(
-        index,
-        candidate_docs,
-        combined_lower,
-        combined_upper,
-        report,
-    )
-    report.variant_candidate_query_ms = (
-        time.perf_counter() - candidate_query_started
-    ) * 1000.0
-    report.variant_candidate_query_rows = raw_row_count
-
-    prepare_started = time.perf_counter()
-    terms_by_length: dict[int, list[int]] = {}
-    for term_id, token_length in candidate_rows:
-        terms_by_length.setdefault(int(token_length), []).append(int(term_id))
-
-    # Sort term IDs once so every RapidFuzz call receives deterministic candidates.
-    for term_ids in terms_by_length.values():
-        term_ids.sort()
-
-    report.variant_candidate_term_ids = len(candidate_rows)
-    report.variant_candidate_prepare_ms = (
-        time.perf_counter() - prepare_started
-    ) * 1000.0
-
-    rapid_started_total = time.perf_counter()
-
-    for position, query_term, query, lower, upper in normalized_queries:
-        rapid_started = time.perf_counter()
-        candidate_term_ids: list[int] = []
-        for token_length in range(lower, upper + 1):
-            candidate_term_ids.extend(terms_by_length.get(token_length, ()))
-
-        candidates = [index.id_to_term[term_id] for term_id in candidate_term_ids]
-        matches = process.extract(
-            query,
-            candidates,
-            scorer=Levenshtein.distance,
-            score_cutoff=config.fuzzy_distance,
-            score_hint=config.fuzzy_distance,
-            limit=None,
-        )
-        matches.sort(key=lambda item: (item[1], item[0]))
-        variants = {
-            int(index.term_to_id[term]): int(distance)
-            for term, distance, _ in matches
-        }
-        rapid_time_ms = (time.perf_counter() - rapid_started) * 1000.0
-        variants_by_term[position] = variants
-        resolution_entries[position] = {
-            "query_term": query_term,
-            "variants": len(variants),
-            "time_ms": rapid_time_ms,
-            "mode_detail": "RapidFuzz after in-memory candidate-term enumeration",
-        }
-
-    report.variant_rapidfuzz_ms = (time.perf_counter() - rapid_started_total) * 1000.0
     report.variant_resolution_ms = (time.perf_counter() - started_total) * 1000.0
-    report.variant_resolution.extend(
-        entry for entry in resolution_entries if entry is not None
-    )
-    return [variants or {} for variants in variants_by_term]
+    report.variant_rapidfuzz_ms = report.variant_resolution_ms
+    report.variant_candidate_term_ids = len(index.term_to_id)
+    report.runtime_candidate_terms = len(index.term_to_id)
+    return variants_by_term
 
 
 def resolve_variants(
@@ -1291,13 +1180,11 @@ def resolve_variants(
     lower = max(0, len(normalized) - config.fuzzy_distance)
     upper = len(normalized) + config.fuzzy_distance
     vocabulary_ids = [
-        int(row["term_id"])
-        for row in query_rows(
-            index.vocabulary,
-            f"token_length BETWEEN {lower} AND {upper}",
-            ["term_id"],
-        )
+        int(term_id)
+        for term_id, token_length in index.term_lengths.items()
+        if lower <= int(token_length) <= upper
     ]
+    vocabulary_ids.sort()
     candidates = [index.id_to_term[term_id] for term_id in vocabulary_ids]
     matches = process.extract(
         normalized,
@@ -1310,7 +1197,7 @@ def resolve_variants(
     matches.sort(key=lambda item: (item[1], item[0]))
     return (
         {int(index.term_to_id[term]): int(distance) for term, distance, _ in matches},
-        "global vocabulary fuzzy scan",
+        "in-memory vocabulary fuzzy scan",
     )
 
 
@@ -1325,7 +1212,7 @@ def fetch_term_frequencies(
     candidate_docs: set[int],
     report: SearchReport | None = None,
 ) -> tuple[dict[int, dict[str, int]], int]:
-    """Read term/document frequencies from the static in-memory cache."""
+    """Fetch only the needed frequency rows for the current candidate documents."""
 
     if not candidate_docs:
         return {}, 0
@@ -1339,29 +1226,37 @@ def fetch_term_frequencies(
     frequency_by_doc_term: dict[int, dict[str, int]] = {
         int(doc_id): {} for doc_id in candidate_docs
     }
-    rows_seen = 0
     normalized_query_terms = [term.casefold() for term in query_terms]
     variant_to_query_terms: dict[int, list[str]] = {}
-
     for query_term, variants in zip(normalized_query_terms, variants_by_term):
         for term_id in variants:
             variant_to_query_terms.setdefault(int(term_id), []).append(query_term)
 
-    for term_id in all_variants:
-        doc_counts = index.term_doc_frequencies.get(int(term_id), {})
-        for doc_id in candidate_docs:
-            if report is not None:
-                report.runtime_frequency_lookups += 1
-            count = int(doc_counts.get(int(doc_id), 0))
-            if count <= 0:
-                continue
+    term_chunk_size = 500
+    rows_seen = 0
+    candidate_doc_ids = sorted(int(doc_id) for doc_id in candidate_docs)
+    for offset in range(0, len(all_variants), term_chunk_size):
+        term_chunk = all_variants[offset : offset + term_chunk_size]
+        predicate = where_in("doc_id", candidate_doc_ids) + " AND " + where_in("term_id", term_chunk)
+        rows = query_rows(
+            index.frequencies,
+            predicate,
+            ["doc_id", "term_id", "occurrence_count"],
+            operation="Frequency planning query",
+        )
+        for row in rows:
+            doc_id = int(row["doc_id"])
+            term_id = int(row["term_id"])
+            count = int(row["occurrence_count"])
             if report is not None:
                 report.runtime_frequency_hits += 1
             rows_seen += 1
-            for query_term in variant_to_query_terms.get(int(term_id), []):
-                target = frequency_by_doc_term.setdefault(int(doc_id), {})
+            for query_term in variant_to_query_terms.get(term_id, []):
+                target = frequency_by_doc_term.setdefault(doc_id, {})
                 target[query_term] = target.get(query_term, 0) + count
 
+    if report is not None:
+        report.runtime_frequency_lookups += len(candidate_doc_ids) * len(all_variants)
     return frequency_by_doc_term, rows_seen
 
 
@@ -1395,7 +1290,7 @@ def choose_anchors(
 # -----------------------------------------------------------------------------
 
 def positions_to_numpy(value: object) -> np.ndarray:
-    """Decode persisted positions into one flat int32 NumPy array."""
+    """Decode persisted flat (start, length) pairs into an int32 NumPy array."""
 
     if value is None:
         return np.empty(0, dtype=np.int32)
@@ -1420,23 +1315,36 @@ def fetch_postings(
     candidate_docs: set[int],
     report: SearchReport | None = None,
 ) -> dict[int, dict[int, np.ndarray]]:
-    """Fetch positional postings from the static in-memory posting cache."""
+    """Fetch only positional postings needed for the current candidate documents."""
 
     if not term_ids or not candidate_docs:
         return {}
 
     grouped: dict[int, dict[int, np.ndarray]] = {}
-    for term_id in sorted(int(value) for value in term_ids):
-        source = index.runtime_postings.get(int(term_id), {})
-        matching = {
-            int(doc_id): positions
-            for doc_id, positions in source.items()
-            if int(doc_id) in candidate_docs
-        }
+    candidate_doc_ids = sorted(int(doc_id) for doc_id in candidate_docs)
+    sorted_term_ids = sorted(int(value) for value in term_ids)
+    term_chunk_size = 500
+
+    for offset in range(0, len(sorted_term_ids), term_chunk_size):
+        term_chunk = sorted_term_ids[offset : offset + term_chunk_size]
+        predicate = where_in("doc_id", candidate_doc_ids) + " AND " + where_in("term_id", term_chunk)
+        rows = query_rows(
+            index.postings,
+            predicate,
+            ["doc_id", "term_id", "positions"],
+            operation="Positional postings query",
+        )
+        for row in rows:
+            term_id = int(row["term_id"])
+            doc_id = int(row["doc_id"])
+            grouped.setdefault(term_id, {})[doc_id] = positions_to_numpy(row["positions"])
+
         if report is not None:
-            report.runtime_posting_lookups += len(candidate_docs)
-            report.runtime_posting_hits += len(matching)
-        grouped[int(term_id)] = matching
+            report.runtime_posting_lookups += len(candidate_doc_ids) * len(term_chunk)
+            report.runtime_posting_hits += len(rows)
+
+    for term_id in sorted_term_ids:
+        grouped.setdefault(term_id, {})
     return grouped
 
 
@@ -1453,7 +1361,8 @@ def build_match_arrays(
             if positions.size == 0:
                 continue
             starts = positions[0::2]
-            ends = positions[1::2]
+            lengths = positions[1::2]
+            ends = starts + lengths
             chunks.setdefault(doc_id, []).append(
                 (
                     np.asarray(starts, dtype=np.int32),
@@ -1787,8 +1696,8 @@ def build_snippet(content: str, chain: list[dict], context_chars: int) -> str:
             + snippet[right:]
         )
 
-    prefix = "\n..." if snippet_start else ""
-    suffix = "...\n" if snippet_end < len(content) else ""
+    prefix = "..." if snippet_start else ""
+    suffix = "..." if snippet_end < len(content) else ""
     return prefix + snippet + suffix
 
 
@@ -1861,6 +1770,7 @@ def create_empty_index(db: object):
     for name in (
         DOCS_TABLE,
         POSTINGS_TABLE,
+        *LEGACY_POSTINGS_TABLES,
         VOCABULARY_TABLE,
         FREQUENCIES_TABLE,
         FTS_TABLE,
@@ -1944,7 +1854,7 @@ def rebuild_index(
             term_to_id,
         )
         postings.extend(document_postings)
-        frequencies.extend(frequency_rows_from_postings(document_postings, term_lengths))
+        frequencies.extend(frequency_rows_from_postings(document_postings))
         doc_word_counts[doc_id] = int(
             sum(len(row["positions"]) // 2 for row in document_postings)
         )
@@ -2140,7 +2050,7 @@ def sync_index(
         )
         new_postings.extend(document_postings)
         new_frequencies.extend(
-            frequency_rows_from_postings(document_postings, index.term_lengths)
+            frequency_rows_from_postings(document_postings)
         )
         index.doc_word_counts[doc_id] = int(
             sum(len(row["positions"]) // 2 for row in document_postings)
@@ -2166,13 +2076,7 @@ def sync_index(
     if changed_docs or added_docs or removed_ids:
         _notify_progress(progress_callback, "Creating FTS index", 0.90)
         index.fts_enabled = refresh_fts_index(index.fts_docs)
-        (
-            index.runtime_postings,
-            index.term_doc_frequencies,
-            index.doc_term_ids,
-            index.document_metadata,
-            index.doc_word_counts,
-        ) = build_runtime_search_caches(index.postings, index.docs)
+        index.document_metadata, index.doc_word_counts = build_runtime_search_caches(index.docs)
 
     _notify_progress(progress_callback, "Indexing complete", 1.0)
     return stats
@@ -2489,13 +2393,7 @@ def delete_document(
         index.fts_enabled = refresh_fts_index(index.fts_docs)
 
         _notify_progress(progress_callback, "Refreshing search caches", 0.90)
-        (
-            index.runtime_postings,
-            index.term_doc_frequencies,
-            index.doc_term_ids,
-            index.document_metadata,
-            index.doc_word_counts,
-        ) = build_runtime_search_caches(index.postings, index.docs)
+        index.document_metadata, index.doc_word_counts = build_runtime_search_caches(index.docs)
         _notify_progress(progress_callback, "Deletion complete", 1.0)
     except Exception:
         # Best-effort rollback of the filesystem move if database cleanup fails.
@@ -2524,39 +2422,18 @@ def delete_document(
 # -----------------------------------------------------------------------------
 
 def build_runtime_search_caches(
-    postings_table: object,
     docs_table: object,
-) -> tuple[
-    dict[int, dict[int, np.ndarray]],
-    dict[int, dict[int, int]],
-    dict[int, set[int]],
-    dict[int, dict],
-    dict[int, int],
-]:
-    """Load the static read-optimized search structures into process memory."""
+) -> tuple[dict[int, dict], dict[int, int]]:
+    """Load only lightweight document metadata needed at startup.
 
-    runtime_postings: dict[int, dict[int, np.ndarray]] = {}
-    term_doc_frequencies: dict[int, dict[int, int]] = {}
-    doc_term_ids: dict[int, set[int]] = {}
-    doc_word_counts: dict[int, int] = {}
-
-    rows = query_rows(
-        postings_table,
-        columns=["doc_id", "term_id", "positions"],
-        operation="Runtime posting cache load",
-    )
-    for row in rows:
-        doc_id = int(row["doc_id"])
-        term_id = int(row["term_id"])
-        positions = positions_to_numpy(row["positions"])
-        runtime_postings.setdefault(term_id, {})[doc_id] = positions
-        term_doc_frequencies.setdefault(term_id, {})[doc_id] = int(positions.size // 2)
-        doc_term_ids.setdefault(doc_id, set()).add(term_id)
-        doc_word_counts[doc_id] = doc_word_counts.get(doc_id, 0) + int(positions.size // 2)
+    Positional postings and term/document frequencies stay in LanceDB and are
+    fetched only for search candidates. This keeps startup memory/time bounded
+    by document and vocabulary metadata rather than the complete occurrence set.
+    """
 
     metadata_rows = query_rows(
         docs_table,
-        columns=["id", "path", "sha256"],
+        columns=["id", "path", "sha256", "word_count"],
         operation="Runtime document metadata load",
     )
     document_metadata = {
@@ -2567,14 +2444,11 @@ def build_runtime_search_caches(
         }
         for row in metadata_rows
     }
-
-    return (
-        runtime_postings,
-        term_doc_frequencies,
-        doc_term_ids,
-        document_metadata,
-        doc_word_counts,
-    )
+    doc_word_counts = {
+        int(row["id"]): int(row.get("word_count", 0) or 0)
+        for row in metadata_rows
+    }
+    return document_metadata, doc_word_counts
 
 
 @dataclass(slots=True)
@@ -2589,9 +2463,6 @@ class SearchIndex:
     id_to_term: dict[int, str]
     term_lengths: dict[int, int]
     doc_word_counts: dict[int, int]
-    runtime_postings: dict[int, dict[int, np.ndarray]] = field(default_factory=dict)
-    term_doc_frequencies: dict[int, dict[int, int]] = field(default_factory=dict)
-    doc_term_ids: dict[int, set[int]] = field(default_factory=dict)
     document_metadata: dict[int, dict] = field(default_factory=dict)
     fts_enabled: bool = False
 
@@ -2601,14 +2472,29 @@ class TextSearchEngine:
         self,
         db_path: str = DB_PATH,
         search_folder: str = SEARCH_FOLDER,
+        *,
+        progress_callback: ProgressCallback | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.search_folder = Path(search_folder).absolute()
         self.search_folder.mkdir(parents=True, exist_ok=True)
+        _notify_progress(progress_callback, "Opening database", 0.05)
         self.db = lancedb.connect(str(self.db_path))
-        self.index: SearchIndex | None = self._open_if_valid()
+        _notify_progress(progress_callback, "Checking database schema", 0.12)
+        self.index: SearchIndex | None = self._open_if_valid(
+            progress_callback=progress_callback,
+        )
+        _notify_progress(
+            progress_callback,
+            "Database ready" if self.index is not None else "No valid index",
+            1.0,
+        )
 
-    def _open_if_valid(self) -> SearchIndex | None:
+    def _open_if_valid(
+        self,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> SearchIndex | None:
         if not index_schema_is_valid(self.db):
             return None
 
@@ -2617,14 +2503,10 @@ class TextSearchEngine:
         vocabulary = self.db.open_table(VOCABULARY_TABLE)
         frequencies = self.db.open_table(FREQUENCIES_TABLE)
         fts_docs = self.db.open_table(FTS_TABLE)
+        _notify_progress(progress_callback, "Loading vocabulary", 0.25)
         term_to_id, id_to_term, term_lengths = load_vocabulary(vocabulary)
-        (
-            runtime_postings,
-            term_doc_frequencies,
-            doc_term_ids,
-            document_metadata,
-            doc_word_counts,
-        ) = build_runtime_search_caches(postings, docs)
+        _notify_progress(progress_callback, "Loading document metadata", 0.75)
+        document_metadata, doc_word_counts = build_runtime_search_caches(docs)
         return SearchIndex(
             db=self.db,
             docs=docs,
@@ -2636,9 +2518,6 @@ class TextSearchEngine:
             id_to_term=id_to_term,
             term_lengths=term_lengths,
             doc_word_counts=doc_word_counts,
-            runtime_postings=runtime_postings,
-            term_doc_frequencies=term_doc_frequencies,
-            doc_term_ids=doc_term_ids,
             document_metadata=document_metadata,
             fts_enabled=True,
         )
@@ -2651,12 +2530,9 @@ class TextSearchEngine:
         if self.index is None:
             return
         (
-            self.index.runtime_postings,
-            self.index.term_doc_frequencies,
-            self.index.doc_term_ids,
             self.index.document_metadata,
             self.index.doc_word_counts,
-        ) = build_runtime_search_caches(self.index.postings, self.index.docs)
+        ) = build_runtime_search_caches(self.index.docs)
 
     def _rebuild_sources(self, extra_paths: list[Path]) -> list[Path]:
         sources = list(self.search_folder.glob("*.txt")) + extra_paths
@@ -2690,6 +2566,7 @@ class TextSearchEngine:
             self._rebuild_sources(extra_paths or []),
             progress_callback=progress_callback,
         )
+        document_metadata, loaded_word_counts = build_runtime_search_caches(docs)
         self.index = SearchIndex(
             db=self.db,
             docs=docs,
@@ -2700,10 +2577,10 @@ class TextSearchEngine:
             term_to_id=term_to_id,
             id_to_term={term_id: term for term, term_id in term_to_id.items()},
             term_lengths={term_id: len(term) for term, term_id in term_to_id.items()},
-            doc_word_counts=doc_word_counts,
+            doc_word_counts=loaded_word_counts or doc_word_counts,
+            document_metadata=document_metadata,
             fts_enabled=fts_enabled,
         )
-        self._refresh_runtime_caches()
 
     def index_files(
         self,
@@ -2746,6 +2623,7 @@ class TextSearchEngine:
                 sources,
                 progress_callback=progress_callback,
             )
+            document_metadata, loaded_word_counts = build_runtime_search_caches(docs)
             self.index = SearchIndex(
                 db=self.db,
                 docs=docs,
@@ -2756,10 +2634,10 @@ class TextSearchEngine:
                 term_to_id=term_to_id,
                 id_to_term={term_id: term for term, term_id in term_to_id.items()},
                 term_lengths={term_id: len(term) for term, term_id in term_to_id.items()},
-                doc_word_counts=doc_word_counts,
+                doc_word_counts=loaded_word_counts or doc_word_counts,
+                document_metadata=document_metadata,
                 fts_enabled=fts_enabled,
             )
-            self._refresh_runtime_caches()
             return {
                 "added": len(current),
                 "changed": 0,
@@ -2844,6 +2722,7 @@ class TextSearchEngine:
             for name in (
                 DOCS_TABLE,
                 POSTINGS_TABLE,
+                *LEGACY_POSTINGS_TABLES,
                 VOCABULARY_TABLE,
                 FREQUENCIES_TABLE,
                 FTS_TABLE,
@@ -3093,9 +2972,9 @@ def format_time_report(report: SearchReport) -> list[str]:
 
     lines.extend([
         "",
-        "Runtime static-cache instrumentation:",
-        f"  - Positional posting cache: {report.runtime_posting_hits:,} cached posting(s) used across {report.runtime_posting_lookups:,} term/document lookup(s)",
-        f"  - Term/document frequency cache: {report.runtime_frequency_hits:,} cached row hit(s) across {report.runtime_frequency_lookups:,} lookup(s)",
+        "Runtime search instrumentation:",
+        f"  - Positional posting rows fetched: {report.runtime_posting_hits:,} across {report.runtime_posting_lookups:,} term/document probe(s)",
+        f"  - Frequency rows fetched: {report.runtime_frequency_hits:,} across {report.runtime_frequency_lookups:,} term/document probe(s)",
         f"  - Fuzzy candidate terms enumerated in memory: {report.runtime_candidate_terms:,}",
         f"  - Result source-file reads: {report.runtime_source_file_reads:,}",
         f"  - LanceDB result-document fallbacks: {report.runtime_lancedb_document_fallbacks:,}",

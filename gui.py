@@ -96,8 +96,8 @@ class SearchFrame(wx.Frame):
     def __init__(self) -> None:
         super().__init__(None, title="Text Search", size=(1200, 850))
         # Keep the GUI construction completely independent from database startup.
-        # TextSearchEngine() can open LanceDB and build the static runtime caches,
-        # so that work is deliberately deferred to a background thread.
+        # TextSearchEngine() opens the persistent index in the background and now
+        # loads only lightweight metadata at startup; postings stay on disk.
         self.engine = None
         self.pending_paths: set[Path] = set()
         self.busy = False
@@ -141,7 +141,11 @@ class SearchFrame(wx.Frame):
                 # Lazy import: this is the expensive native/database stack.
                 import engine as engine_module
 
-                engine_instance = engine_module.TextSearchEngine(DB_PATH, SEARCH_FOLDER)
+                engine_instance = engine_module.TextSearchEngine(
+                    DB_PATH,
+                    SEARCH_FOLDER,
+                    progress_callback=self._queue_index_progress,
+                )
                 wx.CallAfter(
                     self._on_database_loaded,
                     engine_instance,
