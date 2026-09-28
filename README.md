@@ -27,7 +27,8 @@ https://github.com/kalle07/pdf2txt-parser
 * Now you can easily copy and paste to your chat
 
 
-<img width="1482" height="1054" alt="grafik" src="https://github.com/user-attachments/assets/9a90f8d7-acc6-4bcd-b8b1-8a4f15ccfe56" />
+<img width="2355" height="1440" alt="grafik" src="https://github.com/user-attachments/assets/faba23e5-5f69-4ff5-8fca-85f95d78f20b" />
+
 <br>
 <br>
 
