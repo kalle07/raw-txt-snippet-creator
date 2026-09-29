@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          ASSET_NAME="snippet_extractor_v08alpha.exe"
+          ASSET_NAME="TextSearch-by-kalle07.exe"
 
           RELEASE_JSON=$(curl -fsSL \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
