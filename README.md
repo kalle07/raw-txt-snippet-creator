@@ -30,14 +30,15 @@ https://github.com/kalle07/pdf2txt-parser
 
 <img width="1482" height="1054" alt="grafik" src="https://github.com/user-attachments/assets/038d4041-0439-4c9f-ad53-d11ae8660eaa" />
 
-
 <br>
-download exe, no installation, direct working App (~150MB)
-or
-python -m venv venv
-venv\Scripts\activate # On Windows
-pip install -r requirements.txt
-python start.py
+<br>
+
+download exe, no installation, direct working App (~150MB)<br>
+or<br>
+python -m venv venv<br>
+venv\Scripts\activate # On Windows<br>
+pip install -r requirements.txt<br>
+python start.py<br>
 
 <br>
 
