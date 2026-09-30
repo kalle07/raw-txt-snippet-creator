@@ -1,5 +1,8 @@
 # raw-txt-snippet-creator with database
 Actual version: 09-beta<br>
+
+https://github.com/kalle07/raw-txt-snippet-creator/releases/download/v09/TextSearch-by-kalle07.exe
+
 up to 3 keywords linked by <b>and</b>. Its like an embedder only with plain txt search!<br>
 It's like opening a text editor, searching for a keyword, and finding X hits. Now the snippet extractor cuts out a section around each keyword and show it.
 The maximum text found is never larger than the original text, as overlapping sections are merged!<br>
