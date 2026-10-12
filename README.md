@@ -13,8 +13,10 @@ The maximum text found is never larger than the original text, as overlapping se
 -> Will be once indexed first, 10 big books need ~5-10sec
 -> Load database at start < 1sec
 -> Usual search need < 100ms
-- Phrase search function will be implemented shortly.
-- Case-sensitive function will be implemented shortly.
+- Phrase search implemented
+- Case-sensitive implemented
+- document result browser implemented, right click save snippets
+-> A new index should be created in the new version, so there is no backward compatibility
 
 Best in combination with my PDF Parser:
 https://github.com/kalle07/pdf2txt-parser
