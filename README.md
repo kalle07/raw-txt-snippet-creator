@@ -1,5 +1,5 @@
 # raw-txt-snippet-creator with database
-Actual version: 09-beta<br>
+
 
 https://github.com/kalle07/raw-txt-snippet-creator/releases/download/_v02/TextSearch-by-kalle07.exe
 
