@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """wxPython GUI; heavy search-engine imports are deferred until after startup."""
 
+import os
+import sys
 import math
 import re
 import shutil
@@ -10,6 +12,7 @@ import time
 from pathlib import Path
 
 import wx
+import wx.dataview as dv
 import wx.stc as stc
 
 # Keep startup lightweight: do not import engine.py here. It imports LanceDB,
@@ -20,7 +23,9 @@ SEARCH_FOLDER = "txt"
 FUZZY_DISTANCE = 1
 MAX_DISTANCE_CHARS = 200
 SNIPPET_CONTEXT_CHARS = 200
-MAX_RESULTS_DEFAULT = "50" # "all"
+MAX_RESULTS_DEFAULT = "50"  # maximum number of ranked documents
+MAX_RESULTS_PER_DOCUMENT_DEFAULT = "20"  # maximum displayed proximity matches per document
+
 
 
 
@@ -95,21 +100,30 @@ class SearchProgressRing(wx.Panel):
 class SearchFrame(wx.Frame):
     def __init__(self) -> None:
         super().__init__(None, title="Text Search", size=(1200, 850))
-        # Keep the GUI construction completely independent from database startup.
-        # TextSearchEngine() opens the persistent index in the background and now
-        # loads only lightweight metadata at startup; postings stay on disk.
         self.engine = None
         self.pending_paths: set[Path] = set()
         self.busy = False
         self.database_loading = True
         self._engine_module = None
+
         self._index_reset_timer = None
+
+        self._tree_context_event_bound = False
         self._folder_timer = wx.Timer(self)
         self._search_progress_timer = wx.Timer(self)
         self._search_progress_mode = "regex"
         self._search_reset_timer = None
+        # Snapshot of the files actually synchronized with the database.
         self._folder_snapshot: dict[str, tuple[int, int]] = {}
+        # Separate snapshot used only to avoid refreshing the tree repeatedly
+        # while the user has not yet indexed externally added/changed files.
+        self._folder_view_snapshot: dict[str, tuple[int, int]] = {}
         self._keyword_fields: list[wx.TextCtrl] = []
+        self._case_sensitive_fields: list[wx.CheckBox] = []
+        self._document_match_counts: dict[str, int] = {}
+        # Last completed search state consumed by the modeless Document Browser.
+        self._last_search_hits = None
+        self._document_browser = None
 
         self._build_ui()
         self._set_database_action_state(False)
@@ -124,12 +138,15 @@ class SearchFrame(wx.Frame):
         self.Bind(wx.EVT_CLOSE, self._on_close)
         self._folder_timer.Start(3000)
 
+
     def _set_database_action_state(self, ready: bool) -> None:
         """Enable database-dependent actions only after the engine is ready."""
         self.btn_index.Enable(bool(ready))
         self.btn_choose.Enable(bool(ready))
+        self.btn_choose_folder.Enable(bool(ready))
         self.btn_reset_database.Enable(bool(ready))
         self.btn_search.Enable(bool(ready and self.engine is not None and self.engine.has_index))
+        self.btn_document_browser.Enable(bool(ready and self._last_search_hits))
 
     def _start_database_load(self) -> None:
         """Load the persistent index/caches without blocking the wx UI thread."""
@@ -196,8 +213,17 @@ class SearchFrame(wx.Frame):
         if self.engine is None:
             return
 
-        self._refresh_file_list()
-        self._folder_snapshot = self._folder_state()
+        self._refresh_tree()
+        # The manual-index snapshot must come from the database, not from the
+        # filesystem. Files added before startup may exist on disk without being
+        # indexed yet and must therefore remain visible to the Index button.
+        self._folder_snapshot = self._indexed_folder_state()
+        self._folder_view_snapshot = self._folder_state()
+
+        # Show completed index progress briefly, then reset it.
+        self._update_index_progress(1.0, "Database ready")
+        self._schedule_index_progress_reset(delay_ms=1000)
+
         self.search_progress.Reset()
         self.search_progress_label.SetLabel("Database ready")
         self.SetStatusText(
@@ -215,6 +241,17 @@ class SearchFrame(wx.Frame):
     def _build_ui(self) -> None:
         panel = wx.Panel(self)
         root = wx.BoxSizer(wx.VERTICAL)
+
+        top_row = wx.BoxSizer(wx.HORIZONTAL)
+        top_row.AddStretchSpacer(1)
+        self.btn_document_browser = wx.Button(panel, label="document browser")
+        self.btn_document_browser.SetToolTip(
+            "Open the ranked documents and navigate through the matches from the last search."
+        )
+        self.btn_document_browser.Bind(wx.EVT_BUTTON, self._on_document_browser)
+        self.btn_document_browser.Enable(False)
+        top_row.Add(self.btn_document_browser, 0)
+        root.Add(top_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 8)
 
         info = wx.StaticBoxSizer(wx.VERTICAL, panel, "Index")
         info_parent = info.GetStaticBox()
@@ -235,9 +272,16 @@ class SearchFrame(wx.Frame):
         self.btn_index.Bind(wx.EVT_BUTTON, self._on_index_new)
         index_button_row.Add(self.btn_index, 0, wx.RIGHT, 8)
 
-        self.btn_choose = wx.Button(info_parent, label="Choose text file")
+        self.btn_choose = wx.Button(info_parent, label="Choose text file(s)")
         self.btn_choose.Bind(wx.EVT_BUTTON, self._on_choose_files)
         index_button_row.Add(self.btn_choose, 0, wx.RIGHT, 8)
+
+        self.btn_choose_folder = wx.Button(info_parent, label="Choose folder")
+        self.btn_choose_folder.Bind(wx.EVT_BUTTON, self._on_choose_folder)
+        self.btn_choose_folder.SetToolTip(
+            "Pick a directory; all .txt files inside it (recursively) are copied into the search folder."
+        )
+        index_button_row.Add(self.btn_choose_folder, 0, wx.RIGHT, 8)
 
         self.btn_reset_database = wx.Button(info_parent, label="Reset database")
         self.btn_reset_database.Bind(wx.EVT_BUTTON, self._on_reset_database)
@@ -264,57 +308,108 @@ class SearchFrame(wx.Frame):
 
         files_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Files")
         files_parent = files_box.GetStaticBox()
-        self.file_list = wx.ListCtrl(
+
+        self.tree = dv.TreeListCtrl(
             files_parent,
-            style=wx.LC_REPORT | wx.LC_SINGLE_SEL | wx.BORDER_SUNKEN,
+            style=dv.TL_DEFAULT_STYLE | dv.TL_CHECKBOX,
         )
-        self.file_list.InsertColumn(0, "Status", width=110)
-        self.file_list.InsertColumn(1, "File", width=260)
-        self.file_list.InsertColumn(2, "Words", width=100)
-        self.file_list.InsertColumn(3, "Path", width=520)
-        self.file_list.Bind(wx.EVT_RIGHT_DOWN, self._on_file_right_down)
-        files_box.Add(self.file_list, 1, wx.EXPAND | wx.ALL, 6)
+        self.tree.AppendColumn("Name", width=500)
+        self.tree.AppendColumn("Size", width=100)
+        self.tree.AppendColumn("Word Count", width=100)
+        self.tree.AppendColumn("Status", width=150)
+        
+      
+        self.tree.AppendColumn("Results", width=50)
+
+        self.tree.Bind(dv.EVT_TREELIST_ITEM_CHECKED, self._on_tree_checked)
+ 
+        
+        # Row activation (clicking the row area)
+        activated_event = getattr(dv, "EVT_TREELIST_ITEM_ACTIVATED", None)
+        if activated_event is not None:
+            self.tree.Bind(activated_event, self._on_tree_item_activated)
+
+        self._bind_tree_click_handlers()
+  
+
+        files_box.Add(self.tree, 1, wx.EXPAND | wx.ALL, 6)
         root.Add(files_box, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
         search_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Search")
         search_parent = search_box.GetStaticBox()
 
-        # Left: keywords. Right: search parameters.
-        input_grid = wx.FlexGridSizer(3, 4, 7, 12)
-        input_grid.AddGrowableCol(1, 1)
-        input_grid.AddGrowableCol(3, 1)
+        # Three keyword fields (470 px) with an independent case-sensitivity
+        # checkbox directly beside each field. Numeric search settings use compact
+        # 100 px fields in the same rows.
+        input_grid = wx.FlexGridSizer(3, 6, 7, 12)
 
-        keyword_fields = []
-        for label, attr in (
+        keyword_fields: list[wx.TextCtrl] = []
+        case_sensitive_fields: list[wx.CheckBox] = []
+
+        parameter_specs = (
+            ("FUZZY_DISTANCE", FUZZY_DISTANCE),
+            ("MAX_DISTANCE_CHARS", MAX_DISTANCE_CHARS),
+            ("SNIPPET_CONTEXT_CHARS", SNIPPET_CONTEXT_CHARS),
+        )
+
+        keyword_specs = (
             ("Keyword 1", "keyword_1"),
             ("Keyword 2", "keyword_2"),
             ("Keyword 3", "keyword_3"),
-        ):
-            input_grid.Add(wx.StaticText(search_parent, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
-            field = wx.TextCtrl(search_parent)
+        )
+
+        parameter_attr_map = {
+            "FUZZY_DISTANCE": "fuzzy_distance",
+            "MAX_DISTANCE_CHARS": "max_distance_chars",
+            "SNIPPET_CONTEXT_CHARS": "snippet_context_chars",
+        }
+
+        for (label, attr), (parameter_key, parameter_value) in zip(keyword_specs, parameter_specs):
+            input_grid.Add(
+                wx.StaticText(search_parent, label=label),
+                0,
+                wx.ALIGN_CENTER_VERTICAL,
+            )
+
+            field = wx.TextCtrl(search_parent, size=(470, -1))
+            field.SetMinSize((470, -1))
             setattr(self, attr, field)
-            input_grid.Add(field, 1, wx.EXPAND)
+            input_grid.Add(field, 0, wx.ALIGN_CENTER_VERTICAL)
             keyword_fields.append(field)
 
-            if attr == "keyword_1":
-                self.fuzzy_distance = self._add_integer_field(
-                    search_parent, input_grid, "FUZZY_DISTANCE", FUZZY_DISTANCE
-                )
-            elif attr == "keyword_2":
-                self.max_distance_chars = self._add_integer_field(
-                    search_parent, input_grid, "MAX_DISTANCE_CHARS", MAX_DISTANCE_CHARS
-                )
-            else:
-                self.snippet_context_chars = self._add_integer_field(
-                    search_parent, input_grid, "SNIPPET_CONTEXT_CHARS", SNIPPET_CONTEXT_CHARS
-                )
+            case_box = wx.CheckBox(search_parent, label="case-sensitive")
+            case_box.SetValue(False)
+            case_box.SetToolTip("Distinguish uppercase and lowercase letters for this keyword.")
+            input_grid.Add(case_box, 0, wx.ALIGN_CENTER_VERTICAL)
+            case_sensitive_fields.append(case_box)
+
+            spacer = wx.StaticText(search_parent, label="")
+            spacer.SetMinSize((80, -1))
+            input_grid.Add(spacer, 0, wx.ALIGN_CENTER_VERTICAL)
+
+            parameter_label_widget = wx.StaticText(search_parent, label=parameter_key)
+            input_grid.Add(parameter_label_widget, 0, wx.ALIGN_CENTER_VERTICAL)
+
+            parameter_field = wx.TextCtrl(
+                search_parent,
+                value=str(parameter_value),
+                size=(100, -1),
+            )
+            parameter_field.SetMinSize((100, -1))
+            input_grid.Add(parameter_field, 0, wx.ALIGN_CENTER_VERTICAL)
+
+            setattr(self, parameter_attr_map[parameter_key], parameter_field)
+
+
+        #self._keyword_fields = keyword_fields
+        self._case_sensitive_fields = case_sensitive_fields
+
+        search_box.Add(input_grid, 0, wx.EXPAND | wx.ALL, 8)
 
         # TAB navigation between the keyword fields is handled at the frame
         # keyboard-hook level so wx's normal focus traversal cannot insert the
         # fuzzy-distance or other controls into this cycle.
         self._keyword_fields = keyword_fields
-
-        search_box.Add(input_grid, 0, wx.EXPAND | wx.ALL, 8)
 
         control_row = wx.BoxSizer(wx.HORIZONTAL)
         control_row.Add(
@@ -329,7 +424,7 @@ class SearchFrame(wx.Frame):
         control_row.Add(self.mode, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 18)
 
         control_row.Add(
-            wx.StaticText(search_parent, label="Max results"),
+            wx.StaticText(search_parent, label="Max Documents"),
             0,
             wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
             8,
@@ -341,6 +436,27 @@ class SearchFrame(wx.Frame):
         )
         self.max_results.SetToolTip("Enter a positive number, or -1/all for unlimited results.")
         control_row.Add(self.max_results, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 18)
+
+        control_row.Add(
+            wx.StaticText(search_parent, label="Max Results / Document"),
+            0,
+            wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
+            8,
+        )
+        self.max_results_per_document = wx.TextCtrl(
+            search_parent,
+            value=MAX_RESULTS_PER_DOCUMENT_DEFAULT,
+            size=(70, -1),
+        )
+        self.max_results_per_document.SetToolTip(
+            "Maximum proximity matches shown per document. Enter a positive number, or -1/all for unlimited."
+        )
+        control_row.Add(
+            self.max_results_per_document,
+            0,
+            wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
+            18,
+        )
 
         control_row.Add(
             wx.StaticText(search_parent, label="Search:"),
@@ -510,6 +626,7 @@ class SearchFrame(wx.Frame):
 
         row["time"].SetLabel(f"{float(stats['time_ms']):.1f} ms")
 
+
     def _reset_stats(self) -> None:
         empty = {
             "matches": 0,
@@ -520,59 +637,98 @@ class SearchFrame(wx.Frame):
         self._set_stats_row(self.regex_stats, empty)
         self._set_stats_row(self.fuzzy_stats, empty)
 
-    def _set_output_text_with_matches(self, marked_text: str) -> None:
-        """Display marked results without marker characters and style matches.
 
-        Scintilla positions are UTF-8 byte offsets, while Python regex/string
-        positions are character offsets. Convert the recorded character ranges
-        to byte offsets before applying the visual style so highlights stay
-        aligned with the actual displayed characters, including non-ASCII text.
-        """
-        # The engine uses private-use Unicode characters as GUI-only match
-        # delimiters. They are removed before text reaches the control.
+    def _set_output_text_with_matches(self, marked_text: str) -> None:
+        """Display marked results without marker characters and style matches efficiently."""
         open_marker = "\ue000"
         close_marker = "\ue001"
-
-        clean_chars: list[str] = []
-        ranges: list[tuple[int, int]] = []
-        match_start: int | None = None
-
-        for char in marked_text:
-            if char == open_marker:
-                if match_start is None:
-                    match_start = len(clean_chars)
-                continue
-            if char == close_marker:
-                if match_start is not None:
-                    end = len(clean_chars)
-                    if end > match_start:
-                        ranges.append((match_start, end))
-                    match_start = None
-                continue
-            clean_chars.append(char)
-
-        # Fail safe: never expose an unmatched internal marker.
-        if match_start is not None:
-            end = len(clean_chars)
-            if end > match_start:
-                ranges.append((match_start, end))
-
-        text = "".join(clean_chars)
+        
+        # Step 1: Strip markers and collect match ranges in character coordinates
+        pattern = re.compile(re.escape(open_marker) + r"(.*?)" + re.escape(close_marker))
+        
+        clean_parts = []
+        char_ranges = []  # List of (start_char, end_char) in the clean text
+        
+        last_end = 0
+        current_clean_len = 0
+        for match in pattern.finditer(marked_text):
+            if match.start() > last_end:
+                segment = marked_text[last_end:match.start()]
+                clean_parts.append(segment)
+                current_clean_len += len(segment)
+            
+            matched_content = match.group(1)
+            clean_parts.append(matched_content)
+            char_ranges.append((current_clean_len, current_clean_len + len(matched_content)))
+            current_clean_len += len(matched_content)
+            
+            last_end = match.end()
+        
+        if last_end < len(marked_text):
+            clean_parts.append(marked_text[last_end:])
+            
+        text = "".join(clean_parts)
+        
+        # Convert character ranges to byte offsets in ONE pass
+        # Build a prefix sum array of byte lengths for each character
+        # This is O(N) where N is the length of the clean text
+        
+        # Always make the control writable and reset it before replacing text.
+        # This is important for the no-results case, where there are no match
+        # ranges to style and the method would otherwise return early.
         self.output.SetReadOnly(False)
+
+        # Temporarily disable word wrap to speed up layout
+        was_wrap = self.output.GetWrapMode()
+        self.output.SetWrapMode(stc.STC_WRAP_NONE)
+
         self.output.SetText(text)
         self.output.EmptyUndoBuffer()
 
+        if not char_ranges:
+            # No highlighted matches: clear any previous styling and restore state.
+            self.output.StartStyling(0)
+            self.output.SetStyling(self.output.GetTextLength(), 0)
+            self.output.SetWrapMode(was_wrap)
+            self.output.SetReadOnly(True)
+            return
+
+        # Efficiently compute byte offset for each character boundary.
+        # We only need byte offsets at the boundaries of our ranges.
+        boundary_chars = sorted(set(
+            [start for start, _ in char_ranges] +
+            [end for _, end in char_ranges]
+        ))
+
+        target_boundaries = set(boundary_chars)
+        char_to_byte = {}
+        current_byte_pos = 0
+        for i, ch in enumerate(text):
+            if i in target_boundaries:
+                char_to_byte[i] = current_byte_pos
+            current_byte_pos += len(ch.encode("utf-8"))
+
+        # If the very end is a boundary, ensure it is captured.
+        if len(text) in target_boundaries and len(text) not in char_to_byte:
+            char_to_byte[len(text)] = current_byte_pos
+
+        # Apply styling using pre-computed byte offsets.
         self.output.StartStyling(0)
         self.output.SetStyling(self.output.GetTextLength(), 0)
-        for char_start, char_end in ranges:
-            byte_start = len(text[:char_start].encode("utf-8"))
-            byte_end = len(text[:char_end].encode("utf-8"))
+
+        for char_start, char_end in char_ranges:
+            byte_start = char_to_byte.get(char_start, 0)
+            byte_end = char_to_byte.get(char_end, current_byte_pos)
             if byte_end <= byte_start:
                 continue
             self.output.StartStyling(byte_start)
             self.output.SetStyling(byte_end - byte_start, self._output_match_style)
 
+        # Restore wrap mode.
+        self.output.SetWrapMode(was_wrap)
         self.output.SetReadOnly(True)
+
+
 
     def _copy_output_plain_text(self) -> None:
         """Copy selected result text as plain text, never as styled formatting."""
@@ -600,18 +756,6 @@ class SearchFrame(wx.Frame):
             return
         event.Skip()
 
-    @staticmethod
-    def _add_integer_field(
-        parent: wx.Window,
-        grid: wx.FlexGridSizer,
-        label: str,
-        value: int,
-    ) -> wx.TextCtrl:
-        grid.Add(wx.StaticText(parent, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
-        field = wx.TextCtrl(parent, value=str(value))
-        grid.Add(field, 1, wx.EXPAND)
-        return field
-
     def _read_non_negative_int(self, field: wx.TextCtrl, name: str) -> int:
         try:
             value = int(field.GetValue().strip())
@@ -620,6 +764,23 @@ class SearchFrame(wx.Frame):
         if value < 0:
             raise ValueError(f"{name} must be >= 0.")
         return value
+
+    @staticmethod
+    def _read_max_results_per_document(field: wx.TextCtrl) -> int | None:
+        value = field.GetValue().strip().casefold()
+        if value in {"all", "-1"}:
+            return None
+        try:
+            number = int(value)
+        except ValueError as exc:
+            raise ValueError(
+                "MAX_RESULTS_PER_DOCUMENT must be a positive integer, -1, or all."
+            ) from exc
+        if number < 1:
+            raise ValueError(
+                "MAX_RESULTS_PER_DOCUMENT must be a positive integer, -1, or all."
+            )
+        return number
 
     @staticmethod
     def _read_max_results(field: wx.TextCtrl) -> int | None:
@@ -635,64 +796,512 @@ class SearchFrame(wx.Frame):
         return number
 
     # ------------------------------------------------------------------
-    # File list
+    # File tree (checkbox TreeListCtrl)
     # ------------------------------------------------------------------
 
-    def _refresh_file_list(self) -> None:
+    @staticmethod
+    def _format_size(size_bytes: int) -> str:
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        if size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+    def _populate_tree(self) -> None:
+        """Reconcile the tree with current SEARCH_FOLDER contents and pending files.
+
+        Preserves checkbox state on unchanged items by updating in-place rather
+        than rebuilding from scratch.
+        """
         if self.engine is None:
-            self.file_list.DeleteAllItems()
-            idx = self.file_list.InsertItem(0, "LOADING")
-            self.file_list.SetItem(idx, 1, "Database")
-            self.file_list.SetItem(idx, 2, "—")
-            self.file_list.SetItem(idx, 3, "Loading index ...")
-            self.file_list.SetItemData(idx, -1)
+            # During initial load, just show a placeholder
+            self.tree.DeleteAllItems()
+            root = self.tree.GetRootItem()
+            self.tree.AppendItem(root, "Loading index …")
             return
 
-        indexed = {
+        folder = Path(SEARCH_FOLDER).absolute()
+        indexed: dict[str, dict] = {
             str(Path(row["path"]).absolute()): row
             for row in self.engine.list_documents()
         }
-        folder_files = {
-            str(path.absolute()): path
-            for path in Path(SEARCH_FOLDER).absolute().glob("*.txt")
-        }
-        pending = {str(path.absolute()): path for path in self.pending_paths}
+        pending: set[Path] = set(self.pending_paths)
 
-        paths = sorted(
-            set(indexed) | set(folder_files) | set(pending),
-            key=lambda path: str(path).casefold(),
+        # Build the desired state: map of absolute_path -> (name, size_str, word_count_str, status_text)
+        desired_files: dict[str, tuple[str, str, str, str]] = {}
+
+        # External pending files (outside search folder)
+        external_paths = sorted(
+            p for p in pending if not self._inside(p, folder)
         )
-
-        self.file_list.DeleteAllItems()
-        for path_str in paths:
-            path = Path(path_str)
-            if path_str in indexed:
-                status = "INDEXED" if path.exists() else "MISSING"
-                word_count = indexed[path_str].get("word_count")
-                doc_id = int(indexed[path_str]["id"])
-            else:
-                status = "NOT INDEXED"
-                doc_id = -1
+        for path in external_paths:
+            status_text = "Pending" if str(path.absolute()) not in indexed else "Indexed"
+            try:
+                size_str = self._format_size(int(path.stat().st_size))
+            except OSError:
+                size_str = "—"
+            word_count_str = "—"
+            if path.suffix.casefold() == ".txt":
                 try:
                     content = path.read_text(encoding="utf-8", errors="ignore")
-                    word_count = self._get_engine_module().count_words(content)
-                except OSError:
-                    word_count = None
+                    wc = self._get_engine_module().count_words(content)
+                    word_count_str = str(wc) if wc is not None else "—"
+                except (OSError, RuntimeError):
+                    word_count_str = "—"
+            desired_files[str(path.absolute())] = (
+                path.name, size_str, word_count_str, status_text
+            )
 
-            idx = self.file_list.InsertItem(self.file_list.GetItemCount(), status)
-            self.file_list.SetItem(idx, 1, path.name)
-            self.file_list.SetItem(idx, 2, f"{int(word_count):,}" if word_count is not None else "—")
-            self.file_list.SetItem(idx, 3, path_str)
-            self.file_list.SetItemData(idx, doc_id)
+        # Files inside SEARCH_FOLDER
+        try:
+            entries = sorted(folder.rglob("*.txt"), key=lambda p: str(p).casefold())
+        except OSError:
+            entries = []
+
+        for entry in entries:
+            if self._is_deleted_path(entry, folder):
+                continue
+            abs_path = str(entry.absolute())
+            if abs_path in indexed:
+                status_text = "Indexed" if entry.exists() else "MISSING"
+                wc = indexed[abs_path].get("word_count")
+                word_count_str = str(wc) if wc is not None else "—"
+            elif entry in pending or abs_path in {str(p) for p in pending}:
+                status_text = "Pending"
+                try:
+                    content = entry.read_text(encoding="utf-8", errors="ignore")
+                    wc = self._get_engine_module().count_words(content)
+                    word_count_str = str(wc) if wc is not None else "—"
+                except (OSError, RuntimeError):
+                    word_count_str = "—"
+            else:
+                status_text = "Not indexed"
+                word_count_str = "—"
+
+            try:
+                size_str = self._format_size(int(entry.stat().st_size))
+            except OSError:
+                size_str = "—"
+
+            desired_files[abs_path] = (entry.name, size_str, word_count_str, status_text)
+
+        # Now reconcile the tree
+        self._reconcile_tree(desired_files)
+
+
+    def _reconcile_tree(self, desired_files: dict[str, tuple[str, str, str, str]]) -> None:
+        """Update the tree to match desired_files, preserving checkbox state."""
+        internal_root = self.tree.GetRootItem()
+
+        existing_items: dict[str, dv.TreeListItem] = {}
+
+        def collect_existing(node: dv.TreeListItem) -> None:
+            path = self._get_item_path(node)
+            if path is not None:
+                existing_items[str(path.absolute())] = node
+
+            child = self.tree.GetFirstChild(node)
+            while child.IsOk():
+                collect_existing(child)
+                child = self.tree.GetNextSibling(child)
+
+        child = self.tree.GetFirstChild(internal_root)
+        while child.IsOk():
+            collect_existing(child)
+            child = self.tree.GetNextSibling(child)
+
+        desired_paths = set(desired_files)
+        existing_paths = set(existing_items)
+
+        to_remove = existing_paths - desired_paths
+        for path_str in to_remove:
+            item = existing_items.get(path_str)
+            if item is not None and item.IsOk():
+                self.tree.DeleteItem(item)
+
+        if to_remove or (desired_paths - existing_paths):
+            checkbox_states: dict[str, bool] = {}
+            for path_str, item in existing_items.items():
+                if path_str in desired_paths:
+                    checkbox_states[path_str] = (
+                        self.tree.GetCheckedState(item) == wx.CHK_CHECKED
+                    )
+
+            self.tree.DeleteAllItems()
+            self._build_tree_from_desired(desired_files, Path(SEARCH_FOLDER).absolute())
+
+            def restore_checkboxes(node: dv.TreeListItem) -> None:
+                path = self._get_item_path(node)
+                if path is not None:
+                    path_str = str(path.absolute())
+                    if checkbox_states.get(path_str):
+                        self.tree.CheckItem(node, True)
+
+                child = self.tree.GetFirstChild(node)
+                while child.IsOk():
+                    restore_checkboxes(child)
+                    child = self.tree.GetNextSibling(child)
+
+            child = self.tree.GetFirstChild(internal_root)
+            while child.IsOk():
+                restore_checkboxes(child)
+                child = self.tree.GetNextSibling(child)
+        else:
+            for path_str, item in existing_items.items():
+                if path_str in desired_files:
+                    _, size_str, word_count_str, status_text = desired_files[path_str]
+                    self.tree.SetItemText(item, 1, size_str)
+                    self.tree.SetItemText(item, 2, word_count_str)
+                    self.tree.SetItemText(item, 3, status_text)
+
+        self._update_tree_results()
+
+
+
+    def _set_item_path(self, item: dv.TreeListItem, path: Path) -> None:
+        """Attach the authoritative filesystem path to a tree item."""
+        self.tree.SetItemData(item, path)
+
+    def _get_item_path(self, item: dv.TreeListItem | None) -> Path | None:
+        """Return the filesystem path attached to a tree item, if any."""
+        if item is None or not item.IsOk():
+            return None
+
+        data = self.tree.GetItemData(item)
+        if isinstance(data, Path):
+            return data
+        if isinstance(data, str):
+            return Path(data)
+        return None
+
+
+
+    def _build_tree_from_desired(
+        self,
+        desired_files: dict[str, tuple[str, str, str, str]],
+        folder: Path,
+    ) -> None:
+        """Build the tree structure from desired_files mapping."""
+        internal_root = self.tree.GetRootItem()
+
+        external_items: dict[str, tuple[str, str, str, str]] = {}
+        internal_items: dict[str, tuple[str, str, str, str]] = {}
+
+        for path_str, values in desired_files.items():
+            path = Path(path_str)
+            if not self._inside(path, folder):
+                external_items[path_str] = values
+            else:
+                internal_items[path_str] = values
+
+        # External files are root-level leaves.
+        for path_str in sorted(external_items):
+            name, size_str, wc_str, status = external_items[path_str]
+            item = self.tree.AppendItem(internal_root, name)
+            self.tree.SetItemText(item, 1, size_str)
+            self.tree.SetItemText(item, 2, wc_str)
+            self.tree.SetItemText(item, 3, status)
+            self.tree.SetItemText(item, 4, "")
+            self._set_item_path(item, Path(path_str))
+
+        if not internal_items:
+            return
+
+        folders: dict[str, list[tuple[str, str, str, str]]] = {}
+        for path_str, values in internal_items.items():
+            path = Path(path_str)
+            parent_dir = str(path.parent)
+            folders.setdefault(parent_dir, []).append(
+                (path.name, values[1], values[2], values[3])
+            )
+
+        def build_folder(dir_path: str, parent_item: dv.TreeListItem) -> dv.TreeListItem | None:
+            dir_obj = Path(dir_path)
+            dir_name = dir_obj.name or str(dir_obj)
+
+            item = self.tree.AppendItem(parent_item, dir_name)
+            self.tree.SetItemText(item, 1, self._format_size(int(dir_obj.stat().st_size)))
+            self.tree.SetItemText(item, 2, "")
+            self.tree.SetItemText(item, 3, "")
+            self.tree.SetItemText(item, 4, "")
+            self._set_item_path(item, dir_obj)
+
+            for name, fsize, fwc, fstatus in folders.get(dir_path, []):
+                file_path = dir_obj / name
+                file_item = self.tree.AppendItem(item, name)
+                self.tree.SetItemText(file_item, 1, fsize)
+                self.tree.SetItemText(file_item, 2, fwc)
+                self.tree.SetItemText(file_item, 3, fstatus)
+                self.tree.SetItemText(file_item, 4, "")
+                self._set_item_path(file_item, file_path)
+
+            if dir_obj.is_dir():
+                try:
+                    sub_dirs = sorted(
+                        (p for p in dir_obj.iterdir() if p.is_dir()),
+                        key=lambda p: p.name.casefold(),
+                    )
+                except OSError:
+                    sub_dirs = []
+
+                for sub_dir in sub_dirs:
+                    if sub_dir.name == "deleted":
+                        continue
+                    build_folder(str(sub_dir), item)
+
+            return item
+
+        main_folder_item = build_folder(str(folder), internal_root)
+        if main_folder_item is not None and main_folder_item.IsOk():
+            self.tree.Expand(main_folder_item)
+        self.tree.Expand(internal_root)
+
+
+
+    def _refresh_tree(self) -> None:
+        wx.CallAfter(self._populate_tree)
+
+
+    def _update_tree_results(self) -> None:
+        """Update only the Results column for file items."""
+        if self.tree is None:
+            return
+
+        internal_root = self.tree.GetRootItem()
+
+        def update_item(item: dv.TreeListItem) -> None:
+            path = self._get_item_path(item)
+            if path is None:
+                return
+
+            if not path.is_file() or path.suffix.casefold() != ".txt":
+                return
+
+            doc_path_str = str(path.absolute())
+            match_count = self._document_match_counts.get(doc_path_str, 0)
+            results_str = str(match_count) if match_count > 0 else ""
+            self.tree.SetItemText(item, 4, results_str)
+
+        def walk(node: dv.TreeListItem) -> None:
+            update_item(node)
+
+            child = self.tree.GetFirstChild(node)
+            while child.IsOk():
+                walk(child)
+                child = self.tree.GetNextSibling(child)
+
+        child = self.tree.GetFirstChild(internal_root)
+        while child.IsOk():
+            walk(child)
+            child = self.tree.GetNextSibling(child)
+
+
+
+    def _bind_tree_click_handlers(self) -> None:
+        """Bind mouse events to handle row clicks for checkbox toggling."""
+        self.tree.Bind(wx.EVT_LEFT_DOWN, self._on_tree_left_down)
+
+        context_menu_event = getattr(dv, "EVT_TREELIST_ITEM_CONTEXT_MENU", None)
+        if context_menu_event is not None:
+            self.tree.Bind(context_menu_event, self._on_tree_item_context_menu)
+            self._tree_context_event_bound = True
+        else:
+            self._tree_context_event_bound = False
+            self.tree.Bind(wx.EVT_RIGHT_DOWN, self._on_tree_right_down)
+
+
+    def _is_tree_toggleable_row(self, item: dv.TreeListItem | None) -> bool:
+        """Return True for rows whose checkbox may be toggled by row clicks."""
+        if item is None or not item.IsOk():
+            return False
+
+        if self._is_tree_file_item(item):
+            return True
+
+        path = self._get_item_path(item)
+        return path is not None and path.is_dir()
+
+   
+
+    def _on_tree_left_down(self, event: wx.MouseEvent) -> None:
+        """Handle left mouse button down on tree items."""
+        item = self._get_tree_item_from_event(event)
+
+        if item is None or not item.IsOk():
+            event.Skip()
+            return
+
+        if not self._is_tree_toggleable_row(item):
+            event.Skip()
+            return
+
+        # Determine if the click was on the checkbox itself.
+        source = event.GetEventObject()
+        clicked_on_checkbox = False
+
+        if isinstance(source, wx.Window):
+            try:
+                screen_pos = source.ClientToScreen(event.GetPosition())
+                main_window = self.tree
+                get_main = getattr(self.tree, "GetMainWindow", None)
+                if callable(get_main):
+                    try:
+                        candidate = get_main()
+                        if candidate is not None:
+                            main_window = candidate
+                    except Exception:
+                        pass
+
+                pos = main_window.ScreenToClient(screen_pos)
+
+                # If the click is inside the first column, treat it as a checkbox click.
+                col_width = self.tree.GetColumnWidth(0)
+                clicked_on_checkbox = pos.x < col_width
+
+            except Exception:
+                clicked_on_checkbox = False
+
+        if clicked_on_checkbox:
+            # Let wx handle checkbox clicks natively.
+            event.Skip()
+            return
+
+        # Click was on the row area, not the checkbox.
+        try:
+            current_state = int(self.tree.GetCheckedState(item))
+        except Exception:
+            event.Skip()
+            return
+
+        new_state = wx.CHK_UNCHECKED if current_state == wx.CHK_CHECKED else wx.CHK_CHECKED
+        self._apply_tree_check_state(item, new_state)
+
+        # Do not skip the event so wx can still select the row normally.
+
+
+
+
+    def _is_tree_file_item(self, item: dv.TreeListItem | None) -> bool:
+        """Return True for a leaf row representing a .txt file."""
+        if item is None or not item.IsOk():
+            return False
+        name = self.tree.GetItemText(item, 0)
+        if not name.casefold().endswith(".txt"):
+            return False
+        child = self.tree.GetFirstChild(item)
+        return not child.IsOk()
+
+
+    def _on_tree_item_activated(self, event: dv.TreeListEvent) -> None:
+        """Handle row activation clicks on toggleable rows."""
+        item = event.GetItem()
+        if not item.IsOk():
+            event.Skip()
+            return
+
+        if not self._is_tree_toggleable_row(item):
+            event.Skip()
+            return
+
+        try:
+            current_state = int(self.tree.GetCheckedState(item))
+        except Exception:
+            event.Skip()
+            return
+
+        new_state = (
+            wx.CHK_UNCHECKED
+            if current_state == wx.CHK_CHECKED
+            else wx.CHK_CHECKED
+        )
+        self._apply_tree_check_state(item, new_state)
+        event.Skip()
+
+
+
+    def _apply_tree_check_state(
+        self,
+        item: dv.TreeListItem,
+        state: int,
+    ) -> None:
+        """Apply a checkbox state to a file or folder row."""
+        if not item.IsOk():
+            return
+
+        if self._is_tree_file_item(item):
+            self.tree.CheckItem(item, state)
+            return
+
+        # Folder rows propagate to children and subfolders.
+        self.tree.CheckItemRecursively(item, state)
+
+
+
+    def _on_tree_checked(self, event: dv.TreeListEvent) -> None:
+        """Handle native checkbox toggles."""
+        item = event.GetItem()
+        if not item.IsOk():
+            event.Skip()
+            return
+
+        if self._is_tree_file_item(item):
+            event.Skip()
+            return
+
+        # For folders, propagate the new state to children and subfolders.
+        try:
+            current_state = int(self.tree.GetCheckedState(item))
+        except Exception:
+            event.Skip()
+            return
+
+        self._apply_tree_check_state(item, current_state)
+        event.Skip()
+
+
+
+
+
+    def _get_selected_leaf_paths(self) -> set[Path]:
+        """Return absolute paths of all checked leaf .txt files in the tree."""
+        selected: set[Path] = set()
+        internal_root = self.tree.GetRootItem()
+
+        def walk(node: dv.TreeListItem) -> None:
+            if self.tree.GetCheckedState(node) == wx.CHK_CHECKED:
+                path = self._get_item_path(node)
+                if (
+                    path is not None
+                    and path.is_file()
+                    and path.suffix.casefold() == ".txt"
+                ):
+                    selected.add(path.absolute())
+
+            child = self.tree.GetFirstChild(node)
+            while child.IsOk():
+                walk(child)
+                child = self.tree.GetNextSibling(child)
+
+        child = self.tree.GetFirstChild(internal_root)
+        while child.IsOk():
+            walk(child)
+            child = self.tree.GetNextSibling(child)
+
+        return selected
+
 
     def _folder_state(self) -> dict[str, tuple[int, int]]:
+        """Return the current filesystem state of searchable .txt files."""
         folder = Path(SEARCH_FOLDER).absolute()
         state: dict[str, tuple[int, int]] = {}
         try:
-            paths = folder.glob("*.txt")
+            paths = list(folder.rglob("*.txt"))
         except OSError:
             return state
         for path in paths:
+            if self._is_deleted_path(path, folder):
+                continue
             try:
                 stat = path.stat()
             except OSError:
@@ -700,63 +1309,219 @@ class SearchFrame(wx.Frame):
             state[str(path.absolute())] = (int(stat.st_mtime_ns), int(stat.st_size))
         return state
 
+    def _indexed_folder_state(self) -> dict[str, tuple[int, int]]:
+        """Return filesystem state for files that are actually in the database.
+
+        This is deliberately different from ``_folder_state()``.  A file that
+        exists on disk but is not indexed must NOT appear in the indexed
+        snapshot; otherwise the Index New Files button can incorrectly decide
+        that there is nothing to do.  Missing indexed files are retained with a
+        sentinel state so their removal is also detected.
+        """
+        state: dict[str, tuple[int, int]] = {}
+        if self.engine is None:
+            return state
+
+        folder = Path(SEARCH_FOLDER).absolute()
+        for row in self.engine.list_documents():
+            try:
+                path = Path(str(row["path"])).absolute()
+                # Use self._instead of module-level path_in_folder
+                if not self._inside(path, folder) or self._is_deleted_path(path, folder):
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    # Keep the indexed path in the snapshot so the missing file
+                    # is seen as a removal on the next manual synchronization.
+                    state[str(path)] = (-1, -1)
+                    continue
+                state[str(path)] = (int(stat.st_mtime_ns), int(stat.st_size))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return state
+
     def _on_folder_timer(self, _event: wx.TimerEvent) -> None:
         if self.engine is None or self.busy:
             return
 
         current = self._folder_state()
-        if current == self._folder_snapshot:
+        # The timer only tracks what is currently visible on disk.  Do NOT copy
+        # this into _folder_snapshot: that snapshot represents the last state
+        # actually synchronized with the database.  Otherwise a newly created
+        # file gets noticed by the timer, the snapshot advances, and the manual
+        # "Index new files" button incorrectly concludes that nothing changed.
+        if current == self._folder_view_snapshot:
             return
 
-        self._folder_snapshot = current
-        self._refresh_file_list()
+        self._folder_view_snapshot = current
+        self._refresh_tree()
 
     def _on_close(self, _event: wx.CloseEvent) -> None:
         if self._folder_timer.IsRunning():
             self._folder_timer.Stop()
         if self._search_progress_timer.IsRunning():
             self._search_progress_timer.Stop()
-        if self._index_reset_timer is not None:
-            self._index_reset_timer.Stop()
-            self._index_reset_timer = None
-        if self._search_reset_timer is not None:
-            self._search_reset_timer.Stop()
-            self._search_reset_timer = None
+        if self._document_browser is not None:
+            try:
+                self._document_browser.Destroy()
+            except RuntimeError:
+                pass
+            self._document_browser = None
+        self._index_reset_timer = None
         self.Destroy()
 
-    def _on_file_right_down(self, event: wx.MouseEvent) -> None:
-        item_index, _flags = self.file_list.HitTest(event.GetPosition())
-        if item_index == wx.NOT_FOUND:
+
+
+
+    def _get_tree_item_from_event(self, event: wx.MouseEvent) -> dv.TreeListItem | None:
+        """Return the tree item under the mouse event, if any."""
+        source = event.GetEventObject()
+        if not isinstance(source, wx.Window):
+            return None
+
+        try:
+            screen_pos = source.ClientToScreen(event.GetPosition())
+        except Exception:
+            return None
+
+        main_window = self.tree
+        get_main_window = getattr(self.tree, "GetMainWindow", None)
+        if callable(get_main_window):
+            try:
+                candidate = get_main_window()
+                if candidate is not None:
+                    main_window = candidate
+            except Exception:
+                pass
+
+        try:
+            pos = main_window.ScreenToClient(screen_pos)
+        except Exception:
+            return None
+
+        try:
+            hit = self.tree.HitTest(pos)
+        except Exception:
+            return None
+
+        item = hit[0] if isinstance(hit, tuple) else hit
+        if item is None or not item.IsOk():
+            return None
+
+        return item
+
+
+    def _show_tree_item_menu(
+        self,
+        item: dv.TreeListItem,
+        popup_window: wx.Window | None = None,
+        popup_pos: tuple[int, int] | None = None,
+    ) -> None:
+        """Show a context menu for either a text file or a folder tree."""
+        if item is None or not item.IsOk():
             return
 
-        self.file_list.Select(item_index)
-        self.file_list.Focus(item_index)
-        doc_id = int(self.file_list.GetItemData(item_index))
-        if doc_id < 0:
+        abs_path = self._get_item_path(item)
+        if abs_path is None:
             return
 
-        file_name = self.file_list.GetItemText(item_index, 1)
-        path = self.file_list.GetItem(item_index, 3).GetText()
+        is_file = abs_path.is_file() and abs_path.suffix.casefold() == ".txt"
+        is_folder = abs_path.is_dir()
+
+        search_folder = Path(SEARCH_FOLDER).absolute()
+        if is_folder:
+            if abs_path == search_folder or not self._inside(abs_path, search_folder):
+                return
+            if self._is_deleted_path(abs_path, search_folder):
+                return
+        elif not is_file:
+            return
+
+        self.tree.Select(item)
 
         menu = wx.Menu()
-        delete_item = menu.Append(wx.ID_ANY, "Delete from database and move to 'deleted'")
 
-        def on_delete(_event: wx.CommandEvent) -> None:
-            self._on_delete_document(doc_id, file_name, path)
+        if is_file:
+            remove_id = menu.Append(
+                wx.ID_ANY,
+                "Remove from database and move to 'deleted'",
+            )
+            menu.Bind(
+                wx.EVT_MENU,
+                lambda _e, path=abs_path: self._on_remove_from_db_and_move(path),
+                remove_id,
+            )
 
-        menu.Bind(wx.EVT_MENU, on_delete, delete_item)
+            menu.AppendSeparator()
+
+            open_id = menu.Append(wx.ID_ANY, "Open with default viewer")
+            menu.Bind(
+                wx.EVT_MENU,
+                lambda _e, path=abs_path: self._on_open_file(path),
+                open_id,
+            )
+
+        elif is_folder:
+            remove_tree_id = menu.Append(
+                wx.ID_ANY,
+                "Remove folder tree from database and move text files to 'deleted'",
+            )
+            menu.Bind(
+                wx.EVT_MENU,
+                lambda _e, folder=abs_path: self._on_remove_folder_tree_and_move(folder),
+                remove_tree_id,
+            )
+
+        if popup_window is None:
+            popup_window = self.tree
+        if popup_pos is None:
+            screen_pos = wx.GetMousePosition()
+            popup_pos = popup_window.ScreenToClient(screen_pos)
+
         try:
-            self.PopupMenu(menu)
+            popup_window.PopupMenu(menu, popup_pos)
         finally:
             menu.Destroy()
 
-    def _on_delete_document(self, doc_id: int, file_name: str, path: str) -> None:
-        if self.engine is None:
+
+
+    def _on_tree_item_context_menu(self, event: dv.TreeListEvent) -> None:
+        """Preferred TreeListCtrl context-menu event."""
+        item = event.GetItem()
+        if not item.IsOk():
+            event.Skip()
             return
+
+        self._show_tree_item_menu(item)
+
+
+
+    def _on_tree_right_down(self, event: wx.MouseEvent) -> None:
+        """Fallback for ports that deliver right-clicks as ordinary mouse events."""
+        if self._tree_context_event_bound:
+            event.Skip()
+            return
+
+        item = self._get_tree_item_from_event(event)
+        self._show_tree_item_menu(item)
+
+
+
+
+
+
+    def _on_remove_from_db_and_move(self, path: Path) -> None:
+        """Remove one text file from the database and move it to 'deleted'."""
+        if self.engine is None or not path.is_file():
+            return
+
+        file_name = path.name
+        deleted_folder = Path(SEARCH_FOLDER).absolute() / "deleted"
 
         confirmation = wx.MessageBox(
             f"Remove '{file_name}' from the database and move the original file to:\n\n"
-            f"{Path(SEARCH_FOLDER).absolute() / 'deleted'}\n\n"
+            f"{deleted_folder}\n\n"
             f"Source: {path}",
             "Delete indexed file",
             wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING,
@@ -764,42 +1529,276 @@ class SearchFrame(wx.Frame):
         if confirmation != wx.YES:
             return
 
-        if self._index_reset_timer is not None:
-            self._index_reset_timer.Stop()
-            self._index_reset_timer = None
-        self._update_index_progress(0.0, "Deleting")
+        # Cancel any previous completed-progress reset before starting a new job.
+        self._stop_index_reset_timer()
+        self._update_index_progress(0.0, "Removing file")
 
         def work():
             assert self.engine is not None
-            return self.engine.delete_document(
+
+            # Find the document ID corresponding to this path.
+            doc_id = None
+            for row in self.engine.list_documents():
+                if Path(row["path"]).absolute() == path.absolute():
+                    doc_id = int(row["id"])
+                    break
+
+            if doc_id is None:
+                raise ValueError(f"File '{file_name}' not found in database.")
+
+            # delete_document may perform database maintenance/reindexing and reports
+            # progress through the same callback used by indexing.
+            result = self.engine.delete_document(
                 doc_id,
+                path=path,
                 progress_callback=self._queue_index_progress,
             )
+
+            # Move the original file only after database removal succeeded.
+            if path.exists():
+                deleted_folder.mkdir(parents=True, exist_ok=True)
+                destination = deleted_folder / path.name
+
+                if destination.exists():
+                    stem = destination.stem
+                    suffix = destination.suffix
+                    serial = 1
+                    while True:
+                        candidate = deleted_folder / f"{stem} ({serial}){suffix}"
+                        if not candidate.exists():
+                            destination = candidate
+                            break
+                        serial += 1
+
+                shutil.move(str(path), str(destination))
+
+            return result
 
         def done(result, error) -> None:
             self._set_busy(False)
             if error:
                 self._update_index_progress(0.0, "Failed")
-                self.SetStatusText("Deletion failed.")
-                wx.MessageBox(str(error), "Deletion error", wx.OK | wx.ICON_ERROR)
+                self.SetStatusText("File removal failed.")
+                wx.MessageBox(str(error), "Error", wx.OK | wx.ICON_ERROR)
                 return
 
-            self._refresh_file_list()
-            self._folder_snapshot = self._folder_state()
-            self._update_index_progress(1.0, "Ready")
-            if self._index_reset_timer is not None:
-                self._index_reset_timer.Stop()
-            self._index_reset_timer = wx.CallLater(3000, self._reset_index_progress)
+            self._document_match_counts.pop(str(path.absolute()), None)
+            self._reset_stats()
 
-            deleted_path = result.get("deleted_path")
-            if deleted_path:
-                self.SetStatusText(f"Deleted '{file_name}' → {deleted_path}")
-            else:
-                self.SetStatusText(
-                    f"Removed '{file_name}' from the database; source file was missing."
-                )
+            if result and isinstance(result, dict):
+                if result.get("regex") is not None:
+                    self._set_stats_row(self.regex_stats, result["regex"])
+                if result.get("fuzzy") is not None:
+                    self._set_stats_row(self.fuzzy_stats, result["fuzzy"])
+
+            self._refresh_tree()
+            self._folder_snapshot = self._folder_state()
+            self._folder_view_snapshot = dict(self._folder_snapshot)
+
+            # Keep 100% visible for one second after deletion/reindexing.
+            self._update_index_progress(1.0, "Ready")
+            self._schedule_index_progress_reset(delay_ms=1000)
+
+            self.SetStatusText(f"Removed '{path.name}' and moved to 'deleted'.")
 
         self._run_background(work, done)
+
+
+    def _on_remove_folder_tree_and_move(self, folder_path: Path) -> None:
+        """Remove all .txt files below a folder from the database and move them to 'deleted'."""
+        if self.engine is None or not folder_path.is_dir():
+            return
+
+        search_folder = Path(SEARCH_FOLDER).absolute()
+        folder_path = folder_path.absolute()
+
+        # The search-folder root and the hidden deleted tree are never removable.
+        if (
+            folder_path == search_folder
+            or not self._inside(folder_path, search_folder)
+            or self._is_deleted_path(folder_path, search_folder)
+        ):
+            return
+
+        try:
+            text_files = sorted(
+                (
+                    p.absolute()
+                    for p in folder_path.rglob("*.txt")
+                    if p.is_file() and not self._is_deleted_path(p, search_folder)
+                ),
+                key=lambda p: str(p).casefold(),
+            )
+        except OSError as exc:
+            wx.MessageBox(
+                f"Could not scan '{folder_path}': {exc}",
+                "Folder removal",
+                wx.OK | wx.ICON_ERROR,
+            )
+            return
+
+        confirmation = wx.MessageBox(
+            f"Remove the complete folder tree from the database and move all .txt files "
+            f"below it to:\n\n"
+            f"{search_folder / 'deleted' / folder_path.name}\n\n"
+            f"Folder: {folder_path}\n"
+            f"Text files found: {len(text_files)}",
+            "Delete folder tree",
+            wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING,
+        )
+        if confirmation != wx.YES:
+            return
+
+        self._stop_index_reset_timer()
+        self._update_index_progress(0.0, "Removing folder tree")
+
+        def work():
+            assert self.engine is not None
+
+            indexed_rows = list(self.engine.list_documents())
+            indexed_by_path = {
+                Path(row["path"]).absolute(): int(row["id"])
+                for row in indexed_rows
+            }
+
+            targets = [
+                (path, indexed_by_path[path])
+                for path in text_files
+                if path in indexed_by_path
+            ]
+
+            last_result = None
+            total = max(1, len(targets))
+
+            for index, (file_path, doc_id) in enumerate(targets):
+                def item_progress(stage: str, fraction: float, base=index, count=total):
+                    # Reserve the full 0..1 range across all deleted documents.
+                    overall = (base + max(0.0, min(1.0, float(fraction)))) / count
+                    self._queue_index_progress(
+                        f"Removing {file_path.name}: {stage}",
+                        overall,
+                    )
+
+                last_result = self.engine.delete_document(
+                    doc_id,
+                    path=file_path,
+                    progress_callback=item_progress,
+                    move_source=False,
+                    maintenance=False,
+                )
+
+            # Storage cleanup is scheduled at startup (every 20th launch), not
+            # during ordinary document removal/indexing operations.
+
+            # Move only .txt files; preserve their folder structure below the
+            # selected folder under SEARCH_FOLDER/deleted/<selected-folder>/...
+            deleted_root = search_folder / "deleted"
+            destination_root = deleted_root / folder_path.name
+            if destination_root.exists():
+                serial = 1
+                base_name = folder_path.name
+                while True:
+                    candidate = deleted_root / f"{base_name} ({serial})"
+                    if not candidate.exists():
+                        destination_root = candidate
+                        break
+                    serial += 1
+
+            moved_count = 0
+            for source in text_files:
+                if not source.exists():
+                    continue
+                relative = source.relative_to(folder_path)
+                destination = destination_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(destination))
+                moved_count += 1
+
+            # Remove empty directories left behind by the moved text files.
+            try:
+                remaining_dirs = sorted(
+                    (p for p in folder_path.rglob("*") if p.is_dir()),
+                    key=lambda p: len(p.parts),
+                    reverse=True,
+                )
+            except OSError:
+                remaining_dirs = []
+
+            for directory in remaining_dirs:
+                try:
+                    directory.rmdir()
+                except OSError:
+                    # Keep directories containing non-text files or anything
+                    # else that should not be deleted.
+                    pass
+
+            try:
+                folder_path.rmdir()
+            except OSError:
+                pass
+
+            return {
+                "result": last_result,
+                "indexed_count": len(targets),
+                "moved_count": moved_count,
+                "found_count": len(text_files),
+            }
+
+        def done(result, error) -> None:
+            self._set_busy(False)
+            if error:
+                self._update_index_progress(0.0, "Failed")
+                self.SetStatusText("Folder removal failed.")
+                wx.MessageBox(str(error), "Folder removal", wx.OK | wx.ICON_ERROR)
+                return
+
+            # Remove stale pending paths from this tree.
+            self.pending_paths = {
+                p for p in self.pending_paths
+                if not self._inside(p.absolute(), folder_path)
+            }
+
+            self._document_match_counts = {
+                p: count
+                for p, count in self._document_match_counts.items()
+                if not self._inside(Path(p).absolute(), folder_path)
+            }
+            self._reset_stats()
+
+            self._refresh_tree()
+            self._folder_snapshot = self._folder_state()
+            self._folder_view_snapshot = dict(self._folder_snapshot)
+
+            self._update_index_progress(1.0, "Ready")
+            self._schedule_index_progress_reset(delay_ms=1000)
+
+            found_count = int(result.get("found_count", 0)) if isinstance(result, dict) else 0
+            moved_count = int(result.get("moved_count", 0)) if isinstance(result, dict) else 0
+            indexed_count = int(result.get("indexed_count", 0)) if isinstance(result, dict) else 0
+            self.SetStatusText(
+                f"Removed folder tree '{folder_path.name}': "
+                f"{indexed_count} database document(s) removed, "
+                f"{moved_count}/{found_count} text file(s) moved to 'deleted'."
+            )
+
+        self._run_background(work, done)
+
+    def _on_open_file(self, path: Path) -> None:
+        """Open file with system default viewer."""
+        try:
+            wx.LaunchDefaultBrowser(str(path)) # This works for files on some platforms, but better:
+            import subprocess
+            if sys.platform == "win32":
+                os.startfile(str(path))
+            elif sys.platform == "darwin":
+                subprocess.call(["open", str(path)])
+            else:
+                subprocess.call(["xdg-open", str(path)])
+        except Exception as e:
+            wx.MessageBox(f"Could not open file: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+
+
 
     def _on_char_hook(self, event: wx.KeyEvent) -> None:
         """Cycle TAB strictly through Keyword 1, Keyword 2 and Keyword 3."""
@@ -859,7 +1858,7 @@ class SearchFrame(wx.Frame):
         step = max(0.01, (target - current) * 0.35)
         self.search_progress.SetProgress(min(target, current + step))
 
-    def _finish_search_indicator(self, label: str = "Ready", reset_delay_ms: int = 3000) -> None:
+    def _finish_search_indicator(self, label: str = "Ready", reset_delay_ms: int = 1000) -> None:
         if self._search_progress_timer.IsRunning():
             self._search_progress_timer.Stop()
         if self._search_reset_timer is not None:
@@ -881,6 +1880,30 @@ class SearchFrame(wx.Frame):
         value = max(0, min(100, int(round(fraction * 100.0))))
         self.index_progress.SetValue(value)
         self.index_progress_label.SetLabel(f"{value}% — {stage}")
+
+    def _stop_index_reset_timer(self) -> None:
+        """Stop and clear the delayed index-progress reset timer safely."""
+        timer = self._index_reset_timer
+        self._index_reset_timer = None
+        if timer is None:
+            return
+        try:
+            if timer.IsRunning():
+                timer.Stop()
+        except AttributeError:
+            # Be defensive for wx ports/types without IsRunning().
+            try:
+                timer.Stop()
+            except Exception:
+                pass
+
+    def _schedule_index_progress_reset(self, delay_ms: int = 1000) -> None:
+        """Show completed progress briefly, then reset the index gauge."""
+        self._stop_index_reset_timer()
+        self._index_reset_timer = wx.CallLater(
+            delay_ms,
+            self._reset_index_progress,
+        )
 
     def _queue_search_progress(self, stage: str, fraction: float) -> None:
         wx.CallAfter(self._update_search_progress, fraction, stage)
@@ -981,8 +2004,10 @@ class SearchFrame(wx.Frame):
                 wx.MessageBox(str(error), "Copy error", wx.OK | wx.ICON_ERROR)
                 return
             self.pending_paths.update(result or [])
-            self._folder_snapshot = self._folder_state()
-            self._refresh_file_list()
+            # These copied files are not indexed yet. Keep _folder_snapshot at
+            # the last synchronized state so "Index new files" will detect them.
+            self._folder_view_snapshot = self._folder_state()
+            self._refresh_tree()
             copied_count = len(result or [])
             self.SetStatusText(
                 f"Copied {copied_count} text file(s) to {folder}."
@@ -992,10 +2017,77 @@ class SearchFrame(wx.Frame):
 
         self._run_background(copy_files, done)
 
+    def _on_choose_folder(self, _event: wx.CommandEvent) -> None:
+        """Show a directory dialog; copy all .txt files (recursively) into SEARCH_FOLDER."""
+        dialog = wx.DirDialog(
+            self,
+            "Choose folder to scan for text files",
+            style=wx.DD_DEFAULT_STYLE | wx.DD_NEW_DIR_BUTTON,
+        )
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            chosen_dir = Path(dialog.GetPath()).absolute()
+        finally:
+            dialog.Destroy()
+
+        folder = Path(SEARCH_FOLDER).absolute()
+
+        def copy_files() -> list[Path]:
+            folder.mkdir(parents=True, exist_ok=True)
+            copied: list[Path] = []
+            for source in sorted(chosen_dir.rglob("*.txt"), key=lambda p: str(p).casefold()):
+                if not source.is_file():
+                    continue
+                if "deleted" in source.relative_to(chosen_dir).parts:
+                    continue
+                # Preserve sub-folder structure relative to the chosen directory.
+                rel = source.relative_to(chosen_dir)
+                destination = folder / rel
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                # Keep an existing file with the same name intact.
+                if destination.exists() and destination.absolute() != source.absolute():
+                    stem = destination.stem
+                    suffix = destination.suffix
+                    serial = 1
+                    while True:
+                        candidate = destination.parent / f"{stem} ({serial}){suffix}"
+                        if not candidate.exists():
+                            destination = candidate
+                            break
+                        serial += 1
+                shutil.copy2(source, destination)
+                copied.append(destination.absolute())
+            return copied
+
+        def done(result, error) -> None:
+            self._set_busy(False)
+            if error:
+                self.SetStatusText("Copy failed.")
+                wx.MessageBox(str(error), "Copy error", wx.OK | wx.ICON_ERROR)
+                return
+            # Files inside SEARCH_FOLDER are already tracked via the folder scanner;
+            # add them to pending_paths so they appear in the tree as well.
+            self.pending_paths.update(result or [])
+            # These copied files are not indexed yet. Keep _folder_snapshot at
+            # the last synchronized state so "Index new files" will detect them.
+            self._folder_view_snapshot = self._folder_state()
+            self._refresh_tree()
+            copied_count = len(result or [])
+            self.SetStatusText(
+                f"Copied {copied_count} text file(s) from '{chosen_dir.name}' into {folder}."
+                if copied_count
+                else "No .txt files found in the selected folder."
+            )
+
+        self._run_background(copy_files, done)
+
     def _reset_index_progress(self) -> None:
         self._index_reset_timer = None
         self.index_progress.SetValue(0)
         self.index_progress_label.SetLabel("Ready")
+
+
 
     def _on_reset_database(self, _event: wx.CommandEvent) -> None:
         if self.engine is None:
@@ -1019,8 +2111,8 @@ class SearchFrame(wx.Frame):
                 root.Add(warning, 0, wx.EXPAND | wx.ALL, 12)
 
                 buttons = wx.BoxSizer(wx.HORIZONTAL)
-                delete_btn = wx.Button(panel, label="Delete all files and database")
-                move_btn = wx.Button(panel, label="Reset database, move files to delete folder")
+                move_btn = wx.Button(panel, label="Reset database, but move files to deleted folder")                
+                delete_btn = wx.Button(panel, label="Delete ALL files and RESET database")
                 cancel_btn = wx.Button(panel, label="Cancel")
                 buttons.Add(delete_btn, 0, wx.RIGHT, 8)
                 buttons.Add(move_btn, 0, wx.RIGHT, 8)
@@ -1044,9 +2136,8 @@ class SearchFrame(wx.Frame):
         if choice == wx.ID_CANCEL:
             return
 
-        if self._index_reset_timer is not None:
-            self._index_reset_timer.Stop()
-            self._index_reset_timer = None
+        # Clear any pending reset from previous operations.
+        self._stop_index_reset_timer()
         self.pending_paths.clear()
         self._update_index_progress(0.0, "Preparing reset")
 
@@ -1066,13 +2157,15 @@ class SearchFrame(wx.Frame):
                 self.SetStatusText("Database reset failed.")
                 wx.MessageBox(str(error), "Reset database error", wx.OK | wx.ICON_ERROR)
                 return
+            self._refresh_tree()
+            self._folder_snapshot = {}
+            self._folder_view_snapshot = self._folder_state()
 
-            self._refresh_file_list()
-            self._folder_snapshot = self._folder_state()
+
             self._update_index_progress(1.0, "Ready")
-            if self._index_reset_timer is not None:
-                self._index_reset_timer.Stop()
-            self._index_reset_timer = wx.CallLater(3000, self._reset_index_progress)
+            
+            # Keep 100% visible for one second, then reset.
+            self._schedule_index_progress_reset(delay_ms=1000)
 
             action_label = "deleted" if action == "delete" else "moved to deleted"
             file_count = int(result.get("file_count", 0)) if isinstance(result, dict) else 0
@@ -1082,40 +2175,59 @@ class SearchFrame(wx.Frame):
 
         self._run_background(work, done)
 
+
+
+
+
     def _on_index_new(self, _event: wx.CommandEvent) -> None:
-        pending = sorted(
-            self.pending_paths,
-            key=lambda path: str(path).casefold(),
-        )
         folder = Path(SEARCH_FOLDER).absolute()
 
-        if self._index_reset_timer is not None:
-            self._index_reset_timer.Stop()
-            self._index_reset_timer = None
+        # A manual index operation is only needed when the folder contents/metadata
+        # changed or there are explicitly pending external files to add.
+        current_snapshot = self._folder_state()
+        if current_snapshot == self._folder_snapshot and not self.pending_paths:
+            self.SetStatusText("No new files for indexing.")
+            return
+
+        # Stop any existing reset timer. The timer is optional, so never
+        # call IsRunning() on None.
+        self._stop_index_reset_timer()
         self._update_index_progress(0.0, "Starting")
 
         def work():
             if self.engine is None:
                 raise RuntimeError("Database is still loading.")
 
-            external = [path for path in pending if not self._inside(path, folder)]
-            if external:
-                sync_callback = self._scaled_progress(self._queue_index_progress, 0.0, 0.80)
-                manual_callback = self._scaled_progress(self._queue_index_progress, 0.80, 0.20)
-            else:
-                sync_callback = self._queue_index_progress
-                manual_callback = self._queue_index_progress
+            # sync_search_folder() now scans the complete search-folder tree and
+            # incrementally indexes only added/changed documents. External pending
+            # files are the only paths that still need a separate index_files call.
+            sync_callback = self._scaled_progress(self._queue_index_progress, 0.0, 0.90)
+            index_callback = self._scaled_progress(self._queue_index_progress, 0.90, 1.0)
 
             sync_result = self.engine.sync_search_folder(progress_callback=sync_callback)
-            manual_result = self.engine.index_files(
-                external,
-                progress_callback=manual_callback,
-            ) if external else {
-                "added": 0,
-                "changed": 0,
-                "removed": 0,
-                "unchanged": 0,
-            }
+
+            external_pending = sorted(
+                (
+                    p.absolute()
+                    for p in self.pending_paths
+                    if not self._inside(p, folder)
+                ),
+                key=lambda p: str(p).casefold(),
+            )
+            manual_result = (
+                self.engine.index_files(
+                    external_pending,
+                    progress_callback=index_callback,
+                )
+                if external_pending
+                else {
+                    "added": 0,
+                    "changed": 0,
+                    "removed": 0,
+                    "unchanged": 0,
+                }
+            )
+
             return sync_result, manual_result
 
         def done(result, error) -> None:
@@ -1127,29 +2239,77 @@ class SearchFrame(wx.Frame):
                 return
 
             self.pending_paths.clear()
-            self._refresh_file_list()
+            self._refresh_tree()
             sync_result, manual_result = result
             added = sync_result["added"] + manual_result["added"]
             changed = sync_result["changed"] + manual_result["changed"]
             removed = sync_result["removed"] + manual_result["removed"]
+
+            if added == 0 and changed == 0 and removed == 0:
+                self._update_index_progress(1.0, "Ready")
+                self._schedule_index_progress_reset(delay_ms=1000)
+                self._folder_snapshot = self._folder_state()
+                self._folder_view_snapshot = dict(self._folder_snapshot)
+                self.SetStatusText("No new files for indexing.")
+                return
+
             self._update_index_progress(1.0, "Ready")
-            if self._index_reset_timer is not None:
-                self._index_reset_timer.Stop()
-            self._index_reset_timer = wx.CallLater(3000, self._reset_index_progress)
+            self._schedule_index_progress_reset(delay_ms=1000)
+
             self._folder_snapshot = self._folder_state()
+            self._folder_view_snapshot = dict(self._folder_snapshot)
             self.SetStatusText(
                 f"Index updated: {added} added, {changed} changed, {removed} removed."
             )
 
         self._run_background(work, done)
 
+
+
+    def _on_document_browser(self, _event: wx.CommandEvent) -> None:
+        """Open or foreground the modeless browser for the latest search state."""
+        if not self._last_search_hits:
+            wx.MessageBox(
+                "Run a search with results first.",
+                "Document Browser",
+                wx.OK | wx.ICON_INFORMATION,
+            )
+            return
+
+        if self._document_browser is not None:
+            try:
+                if not self._document_browser.IsBeingDeleted():
+                    self._document_browser.update_search_state(self._last_search_hits)
+                    self._document_browser.Raise()
+                    self._document_browser.SetFocus()
+                    return
+            except RuntimeError:
+                pass
+            self._document_browser = None
+
+        from document_browser import DocumentBrowserFrame
+
+        self._document_browser = DocumentBrowserFrame(self, self._last_search_hits)
+        self._document_browser.Show(True)
+        self._document_browser.Raise()
+        self._document_browser.SetFocus()
+
     def _on_search(self, _event: wx.CommandEvent) -> None:
-        terms = [
+        raw_terms = [
             self.keyword_1.GetValue(),
             self.keyword_2.GetValue(),
             self.keyword_3.GetValue(),
         ]
-        terms = [term.strip() for term in terms if term.strip()]
+        raw_case_flags = [
+            checkbox.GetValue() for checkbox in self._case_sensitive_fields
+        ]
+        term_entries = [
+            (term.strip(), bool(case_sensitive))
+            for term, case_sensitive in zip(raw_terms, raw_case_flags)
+            if term.strip()
+        ]
+        terms = [term for term, _case_sensitive in term_entries]
+        case_sensitive = [flag for _term, flag in term_entries]
         if not terms:
             wx.MessageBox(
                 "Enter at least one keyword.",
@@ -1169,6 +2329,9 @@ class SearchFrame(wx.Frame):
                 self.snippet_context_chars, "SNIPPET_CONTEXT_CHARS"
             )
             max_results = self._read_max_results(self.max_results)
+            max_results_per_document = self._read_max_results_per_document(
+                self.max_results_per_document
+            )
         except ValueError as exc:
             wx.MessageBox(str(exc), "Search settings", wx.OK | wx.ICON_WARNING)
             return
@@ -1177,7 +2340,74 @@ class SearchFrame(wx.Frame):
         mode = ("regex", "fuzzy", "both")[selection]
         show_time_report = self.timelogs.GetValue()
 
-        self._start_search_indicator(mode, "Searching ...")
+        # Collect currently checked leaf paths from the tree.
+        selected_paths: set[Path] = self._get_selected_leaf_paths()
+        if not selected_paths:
+            wx.MessageBox(
+                "No text files are checked in the file list.\n"
+                "Check at least one file or folder before searching.",
+                "Search",
+                wx.OK | wx.ICON_INFORMATION,
+            )
+            return
+
+        # Check for unindexed documents
+        if self.engine is not None:
+            indexed_paths = {
+                Path(row["path"]).absolute()
+                for row in self.engine.list_documents()
+            }
+            unindexed = selected_paths - indexed_paths
+            if unindexed:
+                wx.MessageBox(
+                    "One or more documents selected but not indexed.",
+                    "Warning",
+                    wx.OK | wx.ICON_WARNING,
+                )
+        # Continue with search as usual
+
+        # START TIMING
+        t_start = time.perf_counter()
+        self._search_timing = {
+            "start": t_start,
+            "pre_search": 0.0,
+            "search_engine": 0.0,
+            "format_results": 0.0,
+            "ui_update": 0.0,
+            "total": 0.0,
+        }
+
+        self._start_search_indicator(mode, f"Searching {len(selected_paths)} selected file(s) …")
+
+        def _filter_hits_by_selection(
+            hits: list,
+            paths: set[Path],
+        ) -> list:
+            """Keep a unique-content hit when any physical copy is selected.
+
+            Search is indexed once per SHA-256, but the user selects physical
+            file paths. Match against all locations and prefer a selected path
+            for downstream actions such as opening the source file.
+            """
+            filtered: list = []
+            normalized_selected = {Path(path).absolute() for path in paths}
+            for hit in hits:
+                document = hit.document
+                raw_locations = document.get("locations") or []
+                locations = [Path(str(value)).absolute() for value in raw_locations]
+                if not locations:
+                    fallback_path = str(document.get("path", ""))
+                    if fallback_path:
+                        locations = [Path(fallback_path).absolute()]
+                selected_locations = sorted(
+                    (path for path in locations if path in normalized_selected),
+                    key=lambda path: str(path).casefold(),
+                )
+                if selected_locations:
+                    document["selected_locations"] = [str(path) for path in selected_locations]
+                    document["path"] = str(selected_locations[0])
+                    filtered.append(hit)
+            return filtered
 
         def run_search(
             search_mode: str,
@@ -1185,6 +2415,8 @@ class SearchFrame(wx.Frame):
         ) -> tuple[list, object, dict[str, object]]:
             if self.engine is None:
                 raise RuntimeError("Database is still loading.")
+            # Time the engine call specifically
+            t_engine_start = time.perf_counter()
             hits, report = self.engine.search_with_report(
                 terms,
                 search_mode,
@@ -1192,51 +2424,88 @@ class SearchFrame(wx.Frame):
                 max_distance_chars=max_distance_chars,
                 snippet_context_chars=snippet_context_chars,
                 max_results=max_results,
+                max_results_per_document=max_results_per_document,
+                case_sensitive=case_sensitive,
                 progress_callback=progress_callback,
             )
+            t_engine_end = time.perf_counter()
+            
+            # Update the timing dict (thread-safe enough for this use case as it's read in done)
+            self._search_timing["search_engine"] += (t_engine_end - t_engine_start) * 1000.0
+            
+            hits = _filter_hits_by_selection(hits, selected_paths)
             return hits, report, self._stats_from_hits(hits, report)
 
         def work():
+            t_work_start = time.perf_counter()
+            
             if mode != "both":
                 hits, report, stats = run_search(
                     mode,
                     self._queue_search_progress,
                 )
+                
+                # Time formatting
+                t_format_start = time.perf_counter()
                 text = self._get_engine_module().format_results(
                     hits,
                     max_distance_chars=max_distance_chars,
                     snippet_context_chars=snippet_context_chars,
                     report=report if show_time_report else None,
                 )
+                t_format_end = time.perf_counter()
+                
+                self._search_timing["format_results"] += (t_format_end - t_format_start) * 1000.0
+                
                 return {
                     "text": text,
                     "regex": stats if mode == "regex" else None,
                     "fuzzy": stats if mode == "fuzzy" else None,
+                    "hits": hits,
                 }
 
-            regex_hits, regex_report, regex_stats = run_search(
-                "regex",
-                self._scaled_progress(self._queue_search_progress, 0.0, 0.50),
-            )
-            fuzzy_hits, fuzzy_report, fuzzy_stats = run_search(
-                "fuzzy",
-                self._scaled_progress(self._queue_search_progress, 0.50, 0.50),
-            )
-            return {
-                "text": self._format_both(
-                    regex_hits,
-                    fuzzy_hits,
-                    max_distance_chars,
-                    snippet_context_chars,
-                    fuzzy_distance,
-                    regex_report if show_time_report else None,
-                    fuzzy_report if show_time_report else None,
-                ),
-                "regex": regex_stats,
-                "fuzzy": fuzzy_stats,
-            }
+            if mode == "both":
+                regex_hits, regex_report, regex_stats = run_search(
+                    "regex",
+                    self._scaled_progress(self._queue_search_progress, 0.0, 0.50),
+                )
+                fuzzy_hits, fuzzy_report, fuzzy_stats = run_search(
+                    "fuzzy",
+                    self._scaled_progress(self._queue_search_progress, 0.50, 0.50),
+                )
+                engine_mod = self._get_engine_module()
+                text = "\n".join([
+                    "REGEX RESULTS",
+                    "=" * 72,
+                    engine_mod.format_results(
+                        regex_hits,
+                        max_distance_chars=max_distance_chars,
+                        snippet_context_chars=snippet_context_chars,
+                        report=regex_report if show_time_report else None,
+                    ),
+                    "",
+                    "",
+                    f"FUZZ RESULTS (edit distance <= {fuzzy_distance})",
+                    "=" * 72,
+                    engine_mod.format_results(
+                        fuzzy_hits,
+                        max_distance_chars=max_distance_chars,
+                        snippet_context_chars=snippet_context_chars,
+                        report=fuzzy_report if show_time_report else None,
+                    ),
+                ])
+            
+                return {
+                    "text": text,
+                    "regex": regex_stats,
+                    "fuzzy": fuzzy_stats,
+                    "hits": {"regex": regex_hits, "fuzzy": fuzzy_hits},
+                }
+
+
 
         def done(result, error) -> None:
+            t_done_start = time.perf_counter()
             self._set_busy(False)
             if error:
                 if self._search_progress_timer.IsRunning():
@@ -1249,20 +2518,43 @@ class SearchFrame(wx.Frame):
                 wx.MessageBox(str(error), "Search error", wx.OK | wx.ICON_ERROR)
                 return
 
-            if mode == "both":
-                total_ms = 0.0
-                if result["regex"] is not None:
-                    total_ms += float(result["regex"]["time_ms"])
-                if result["fuzzy"] is not None:
-                    total_ms += float(result["fuzzy"]["time_ms"])
-            else:
-                active_stats = result[mode]
-                total_ms = float(active_stats["time_ms"]) if active_stats is not None else 0.0
+            # Update match counts per document
+            self._document_match_counts.clear()
+            
+            hits_data = result.get("hits")
+            if hits_data:
+                if mode == "both":
+                    all_hits = []
+                    if isinstance(hits_data, dict):
+                        all_hits.extend(hits_data.get("regex", []))
+                        all_hits.extend(hits_data.get("fuzzy", []))
+                    else:
+                        all_hits = hits_data
+                else:
+                    all_hits = hits_data if isinstance(hits_data, list) else []
+                
+                # Count matches per document
+                for hit in all_hits:
+                    # One hit represents unique content, but all selected copies
+                    # have the same matched text and therefore share its chain count.
+                    matched_paths = hit.document.get("selected_locations") or [
+                        hit.document.get("path", "")
+                    ]
+                    for doc_path in matched_paths:
+                        doc_path = str(doc_path)
+                        if doc_path:
+                            self._document_match_counts[doc_path] = (
+                                self._document_match_counts.get(doc_path, 0) + len(hit.chains)
+                            )
+
             self._reset_stats()
             if result["regex"] is not None:
                 self._set_stats_row(self.regex_stats, result["regex"])
             if result["fuzzy"] is not None:
                 self._set_stats_row(self.fuzzy_stats, result["fuzzy"])
+                
+            # Time UI update
+            t_ui_start = time.perf_counter()
 
             self._set_output_text_with_matches(
                 result["text"] or "No proximity matches found."
@@ -1271,44 +2563,48 @@ class SearchFrame(wx.Frame):
             self.output.SetAnchor(0)
             self.output.ScrollToStart()
             self.output.SetFocus()
-            self._finish_search_indicator("Search complete.", reset_delay_ms=3000)
+            t_ui_end = time.perf_counter()
+
+            self._search_timing["ui_update"] += (t_ui_end - t_ui_start) * 1000.0
+             
+            self._finish_search_indicator("Search complete.", reset_delay_ms=1000)
             self.SetStatusText("Search complete.")
+            
+            # Refresh tree to show updated match counts
+            self._update_tree_results()
+
+            # Preserve the completed, selection-filtered search result state for
+            # the modeless Document Browser. If it is already open, refresh it
+            # immediately so it continues to represent the last search.
+            self._last_search_hits = result.get("hits")
+            self.btn_document_browser.Enable(bool(self._last_search_hits))
+            if self._document_browser is not None:
+                try:
+                    if self._document_browser.IsBeingDeleted():
+                        self._document_browser = None
+                    else:
+                        self._document_browser.update_search_state(self._last_search_hits)
+                        self._document_browser.Raise()
+                except RuntimeError:
+                    self._document_browser = None
+
+            # Calculate total and log
+            t_done_end = time.perf_counter()
+            total_ms = (t_done_end - t_start) * 1000.0
+            self._search_timing["total"] = total_ms
+            
+            # Print detailed breakdown to console/debug log
+            print(f"--- SEARCH TIMING BREAKDOWN ---")
+            print(f"Total Time: {total_ms:.2f} ms")
+            print(f"Engine Search: {self._search_timing['search_engine']:.2f} ms")
+            print(f"Format Results: {self._search_timing['format_results']:.2f} ms")
+            print(f"UI Update (SetText/Styling): {self._search_timing['ui_update']:.2f} ms")
+            print(f"Other/Overhead: {total_ms - self._search_timing['search_engine'] - self._search_timing['format_results'] - self._search_timing['ui_update']:.2f} ms")
+            print("---------------------------")
+
 
         self._run_background(work, done)
 
-    @staticmethod
-    def _format_both(
-        regex_hits: list,
-        fuzzy_hits: list,
-        max_distance_chars: int,
-        snippet_context_chars: int,
-        fuzzy_distance: int,
-        regex_report,
-        fuzzy_report,
-    ) -> str:
-        from engine import format_results
-
-        blocks = [
-            "REGEX RESULTS",
-            "=" * 72,
-            format_results(
-                regex_hits,
-                max_distance_chars=max_distance_chars,
-                snippet_context_chars=snippet_context_chars,
-                report=regex_report,
-            ),
-            "",
-            "",
-            f"FUZZ RESULTS (edit distance <= {fuzzy_distance})",
-            "=" * 72,
-            format_results(
-                fuzzy_hits,
-                max_distance_chars=max_distance_chars,
-                snippet_context_chars=snippet_context_chars,
-                report=fuzzy_report,
-            ),
-        ]
-        return "\n".join(blocks)
 
     @staticmethod
     def _inside(path: Path, folder: Path) -> bool:
@@ -1317,6 +2613,15 @@ class SearchFrame(wx.Frame):
             return True
         except ValueError:
             return False
+
+    @staticmethod
+    def _is_deleted_path(path: Path, folder: Path) -> bool:
+        try:
+            rel = path.relative_to(folder)
+        except ValueError:
+            return "deleted" in path.parts
+        return "deleted" in rel.parts
+
 
 
 class SearchApp(wx.App):
@@ -1340,3 +2645,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
