@@ -3,6 +3,8 @@ from __future__ import annotations
 """wxPython GUI; heavy search-engine imports are deferred until after startup."""
 
 import os
+import faulthandler
+import traceback
 import sys
 import math
 import re
@@ -100,6 +102,17 @@ class SearchProgressRing(wx.Panel):
 class SearchFrame(wx.Frame):
     def __init__(self) -> None:
         super().__init__(None, title="Text Search", size=(1200, 850))
+        self._reset_debug_path = Path(DB_PATH).absolute().parent / "reset_debug.log"
+        self._reset_debug_lock = threading.Lock()
+        self._faulthandler_stream = None
+        try:
+            self._faulthandler_stream = self._reset_debug_path.open(
+                "a", encoding="utf-8", buffering=1
+            )
+            faulthandler.enable(file=self._faulthandler_stream, all_threads=True)
+        except Exception:
+            self._write_reset_debug("Could not enable faulthandler", traceback.format_exc())
+        self._write_reset_debug("GUI STARTED", f"pid={os.getpid()} cwd={Path.cwd()}")
         self.engine = None
         self.pending_paths: set[Path] = set()
         self.busy = False
@@ -119,6 +132,8 @@ class SearchFrame(wx.Frame):
         # while the user has not yet indexed externally added/changed files.
         self._folder_view_snapshot: dict[str, tuple[int, int]] = {}
         self._keyword_fields: list[wx.TextCtrl] = []
+        self._regex_search_fields: list[wx.CheckBox] = []
+        self._fuzzy_search_fields: list[wx.CheckBox] = []
         self._case_sensitive_fields: list[wx.CheckBox] = []
         self._document_match_counts: dict[str, int] = {}
         # Last completed search state consumed by the modeless Document Browser.
@@ -338,13 +353,22 @@ class SearchFrame(wx.Frame):
         search_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Search")
         search_parent = search_box.GetStaticBox()
 
-        # Three keyword fields (470 px) with an independent case-sensitivity
-        # checkbox directly beside each field. Numeric search settings use compact
-        # 100 px fields in the same rows.
-        input_grid = wx.FlexGridSizer(3, 6, 7, 12)
+        # One row per keyword. The three search options remain directly aligned
+        # with their header columns so every option belongs to exactly one term.
+        input_grid = wx.FlexGridSizer(4, 8, 7, 8)
 
         keyword_fields: list[wx.TextCtrl] = []
+        regex_search_fields: list[wx.CheckBox] = []
+        fuzzy_search_fields: list[wx.CheckBox] = []
         case_sensitive_fields: list[wx.CheckBox] = []
+
+        # Header row for the per-keyword option columns.
+        for header in ("", "", "regex-search", "fuzzy-search", "case sensitive", "", "", ""):
+            input_grid.Add(
+                wx.StaticText(search_parent, label=header),
+                0,
+                wx.ALIGN_CENTER_VERTICAL,
+            )
 
         parameter_specs = (
             ("FUZZY_DISTANCE", FUZZY_DISTANCE),
@@ -371,20 +395,32 @@ class SearchFrame(wx.Frame):
                 wx.ALIGN_CENTER_VERTICAL,
             )
 
-            field = wx.TextCtrl(search_parent, size=(470, -1))
-            field.SetMinSize((470, -1))
+            field = wx.TextCtrl(search_parent, size=(380, -1))
+            field.SetMinSize((380, -1))
             setattr(self, attr, field)
             input_grid.Add(field, 0, wx.ALIGN_CENTER_VERTICAL)
             keyword_fields.append(field)
 
-            case_box = wx.CheckBox(search_parent, label="case-sensitive")
+            regex_box = wx.CheckBox(search_parent, label="regex-search")
+            regex_box.SetValue(True)
+            regex_box.SetToolTip("Search this keyword using regex/wildcard matching.")
+            input_grid.Add(regex_box, 0, wx.ALIGN_CENTER_VERTICAL)
+            regex_search_fields.append(regex_box)
+
+            fuzzy_box = wx.CheckBox(search_parent, label="fuzzy-search")
+            fuzzy_box.SetValue(False)
+            fuzzy_box.SetToolTip("Search this keyword using edit-distance matching.")
+            input_grid.Add(fuzzy_box, 0, wx.ALIGN_CENTER_VERTICAL)
+            fuzzy_search_fields.append(fuzzy_box)
+
+            case_box = wx.CheckBox(search_parent, label="case sensitive")
             case_box.SetValue(False)
             case_box.SetToolTip("Distinguish uppercase and lowercase letters for this keyword.")
             input_grid.Add(case_box, 0, wx.ALIGN_CENTER_VERTICAL)
             case_sensitive_fields.append(case_box)
 
             spacer = wx.StaticText(search_parent, label="")
-            spacer.SetMinSize((80, -1))
+            spacer.SetMinSize((8, -1))
             input_grid.Add(spacer, 0, wx.ALIGN_CENTER_VERTICAL)
 
             parameter_label_widget = wx.StaticText(search_parent, label=parameter_key)
@@ -393,16 +429,17 @@ class SearchFrame(wx.Frame):
             parameter_field = wx.TextCtrl(
                 search_parent,
                 value=str(parameter_value),
-                size=(100, -1),
+                size=(70, -1),
             )
-            parameter_field.SetMinSize((100, -1))
+            parameter_field.SetMinSize((70, -1))
             input_grid.Add(parameter_field, 0, wx.ALIGN_CENTER_VERTICAL)
 
             setattr(self, parameter_attr_map[parameter_key], parameter_field)
 
-
-        #self._keyword_fields = keyword_fields
         self._case_sensitive_fields = case_sensitive_fields
+        self._regex_search_fields = regex_search_fields
+        self._fuzzy_search_fields = fuzzy_search_fields
+        self._keyword_fields = keyword_fields
 
         search_box.Add(input_grid, 0, wx.EXPAND | wx.ALL, 8)
 
@@ -412,17 +449,6 @@ class SearchFrame(wx.Frame):
         self._keyword_fields = keyword_fields
 
         control_row = wx.BoxSizer(wx.HORIZONTAL)
-        control_row.Add(
-            wx.StaticText(search_parent, label="Search mode"),
-            0,
-            wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
-            8,
-        )
-        self.mode = wx.Choice(search_parent, choices=["Regex", "Fuzz", "Both"])
-        self.mode.SetSelection(0)
-        self.mode.SetMinSize((105, -1))
-        control_row.Add(self.mode, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 18)
-
         control_row.Add(
             wx.StaticText(search_parent, label="Max Documents"),
             0,
@@ -496,7 +522,7 @@ class SearchFrame(wx.Frame):
         stats_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Search statistics")
         stats_parent = stats_box.GetStaticBox()
 
-        stats_grid = wx.FlexGridSizer(3, 4, 5, 14)
+        stats_grid = wx.FlexGridSizer(2, 4, 5, 14)
         stats_grid.AddGrowableCol(1, 1)
         stats_grid.AddGrowableCol(2, 1)
         stats_grid.AddGrowableCol(3, 1)
@@ -508,8 +534,7 @@ class SearchFrame(wx.Frame):
                 wx.ALIGN_CENTER_VERTICAL,
             )
 
-        self.regex_stats = self._create_stats_row(stats_parent, stats_grid, "Regex")
-        self.fuzzy_stats = self._create_stats_row(stats_parent, stats_grid, "Fuzzy")
+        self.search_stats = self._create_stats_row(stats_parent, stats_grid, "Search")
         stats_box.Add(stats_grid, 0, wx.EXPAND | wx.ALL, 8)
         root.Add(stats_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
@@ -634,8 +659,7 @@ class SearchFrame(wx.Frame):
             "term_order": [],
             "time_ms": 0.0,
         }
-        self._set_stats_row(self.regex_stats, empty)
-        self._set_stats_row(self.fuzzy_stats, empty)
+        self._set_stats_row(self.search_stats, empty)
 
 
     def _set_output_text_with_matches(self, marked_text: str) -> None:
@@ -1358,6 +1382,17 @@ class SearchFrame(wx.Frame):
         self._refresh_tree()
 
     def _on_close(self, _event: wx.CloseEvent) -> None:
+        self._write_reset_debug("GUI CLOSING")
+        try:
+            faulthandler.disable()
+        except Exception:
+            pass
+        if self._faulthandler_stream is not None:
+            try:
+                self._faulthandler_stream.flush()
+                self._faulthandler_stream.close()
+            except Exception:
+                pass
         if self._folder_timer.IsRunning():
             self._folder_timer.Stop()
         if self._search_progress_timer.IsRunning():
@@ -1584,12 +1619,6 @@ class SearchFrame(wx.Frame):
 
             self._document_match_counts.pop(str(path.absolute()), None)
             self._reset_stats()
-
-            if result and isinstance(result, dict):
-                if result.get("regex") is not None:
-                    self._set_stats_row(self.regex_stats, result["regex"])
-                if result.get("fuzzy") is not None:
-                    self._set_stats_row(self.fuzzy_stats, result["fuzzy"])
 
             self._refresh_tree()
             self._folder_snapshot = self._folder_state()
@@ -1930,6 +1959,7 @@ class SearchFrame(wx.Frame):
         if busy:
             self.btn_index.Enable(False)
             self.btn_choose.Enable(False)
+            self.btn_choose_folder.Enable(False)
             self.btn_reset_database.Enable(False)
             self.btn_search.Enable(False)
             return
@@ -2089,6 +2119,23 @@ class SearchFrame(wx.Frame):
 
 
 
+    def _write_reset_debug(self, message: str, details: str | None = None) -> None:
+        """Append reset diagnostics to a persistent log, including worker failures."""
+        try:
+            line = (
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} [GUI-RESET] "
+                f"thread={threading.current_thread().name} {message}"
+            )
+            if details:
+                line += "\n" + details.rstrip()
+            with self._reset_debug_lock:
+                with self._reset_debug_path.open("a", encoding="utf-8", buffering=1) as stream:
+                    stream.write(line + "\n")
+            print(line, flush=True)
+        except Exception:
+            # Keep diagnostics best-effort and never disrupt GUI recovery.
+            pass
+
     def _on_reset_database(self, _event: wx.CommandEvent) -> None:
         if self.engine is None:
             return
@@ -2142,15 +2189,26 @@ class SearchFrame(wx.Frame):
         self._update_index_progress(0.0, "Preparing reset")
 
         action = "delete" if choice == wx.ID_YES else "move"
+        self._write_reset_debug("RESET REQUESTED", f"action={action}")
 
         def work():
+            self._write_reset_debug("RESET WORKER BEGIN", f"action={action}")
             assert self.engine is not None
-            return self.engine.reset_database(
+            result = self.engine.reset_database(
                 action,
                 progress_callback=self._queue_index_progress,
             )
+            self._write_reset_debug("RESET WORKER RETURNED", repr(result))
+            return result
 
         def done(result, error) -> None:
+            self._write_reset_debug(
+                "RESET CALLBACK", f"result={result!r} error={error!r}",
+            )
+            if error is not None:
+                self._write_reset_debug("RESET EXCEPTION", "".join(
+                    traceback.format_exception(type(error), error, error.__traceback__)
+                ))
             self._set_busy(False)
             if error:
                 self._update_index_progress(0.0, "Failed")
@@ -2198,9 +2256,10 @@ class SearchFrame(wx.Frame):
             if self.engine is None:
                 raise RuntimeError("Database is still loading.")
 
-            # sync_search_folder() now scans the complete search-folder tree and
-            # incrementally indexes only added/changed documents. External pending
-            # files are the only paths that still need a separate index_files call.
+            # sync_search_folder() scans the complete folder. If the database has
+            # zero indexed documents it uses the same bulk builder as first launch;
+            # otherwise it incrementally updates only changed/new content. External
+            # pending files still need a separate index_files call.
             sync_callback = self._scaled_progress(self._queue_index_progress, 0.0, 0.90)
             index_callback = self._scaled_progress(self._queue_index_progress, 0.90, 1.0)
 
@@ -2300,16 +2359,37 @@ class SearchFrame(wx.Frame):
             self.keyword_2.GetValue(),
             self.keyword_3.GetValue(),
         ]
-        raw_case_flags = [
-            checkbox.GetValue() for checkbox in self._case_sensitive_fields
-        ]
-        term_entries = [
-            (term.strip(), bool(case_sensitive))
-            for term, case_sensitive in zip(raw_terms, raw_case_flags)
-            if term.strip()
-        ]
-        terms = [term for term, _case_sensitive in term_entries]
-        case_sensitive = [flag for _term, flag in term_entries]
+        raw_regex_flags = [checkbox.GetValue() for checkbox in self._regex_search_fields]
+        raw_fuzzy_flags = [checkbox.GetValue() for checkbox in self._fuzzy_search_fields]
+        raw_case_flags = [checkbox.GetValue() for checkbox in self._case_sensitive_fields]
+
+        terms: list[str] = []
+        term_modes: list[str] = []
+        case_sensitive: list[bool] = []
+        for index, (term, regex_enabled, fuzzy_enabled, sensitive) in enumerate(
+            zip(raw_terms, raw_regex_flags, raw_fuzzy_flags, raw_case_flags),
+            start=1,
+        ):
+            cleaned = term.strip()
+            if not cleaned:
+                continue
+            if not regex_enabled and not fuzzy_enabled:
+                wx.MessageBox(
+                    f"Keyword {index}: enable at least one of regex-search or fuzzy-search.",
+                    "Search settings",
+                    wx.OK | wx.ICON_WARNING,
+                )
+                return
+            if regex_enabled and fuzzy_enabled:
+                term_mode = "both"
+            elif regex_enabled:
+                term_mode = "regex"
+            else:
+                term_mode = "fuzzy"
+            terms.append(cleaned)
+            term_modes.append(term_mode)
+            case_sensitive.append(bool(sensitive))
+
         if not terms:
             wx.MessageBox(
                 "Enter at least one keyword.",
@@ -2336,8 +2416,11 @@ class SearchFrame(wx.Frame):
             wx.MessageBox(str(exc), "Search settings", wx.OK | wx.ICON_WARNING)
             return
 
-        selection = self.mode.GetSelection()
-        mode = ("regex", "fuzzy", "both")[selection]
+        mode_summary = (
+            term_modes[0]
+            if all(value == term_modes[0] for value in term_modes)
+            else "mixed"
+        )
         show_time_report = self.timelogs.GetValue()
 
         # Collect currently checked leaf paths from the tree.
@@ -2351,7 +2434,7 @@ class SearchFrame(wx.Frame):
             )
             return
 
-        # Check for unindexed documents
+        # Check for unindexed documents.
         if self.engine is not None:
             indexed_paths = {
                 Path(row["path"]).absolute()
@@ -2364,9 +2447,7 @@ class SearchFrame(wx.Frame):
                     "Warning",
                     wx.OK | wx.ICON_WARNING,
                 )
-        # Continue with search as usual
 
-        # START TIMING
         t_start = time.perf_counter()
         self._search_timing = {
             "start": t_start,
@@ -2376,19 +2457,13 @@ class SearchFrame(wx.Frame):
             "ui_update": 0.0,
             "total": 0.0,
         }
+        self._start_search_indicator(
+            mode_summary,
+            f"Searching {len(selected_paths)} selected file(s) …",
+        )
 
-        self._start_search_indicator(mode, f"Searching {len(selected_paths)} selected file(s) …")
-
-        def _filter_hits_by_selection(
-            hits: list,
-            paths: set[Path],
-        ) -> list:
-            """Keep a unique-content hit when any physical copy is selected.
-
-            Search is indexed once per SHA-256, but the user selects physical
-            file paths. Match against all locations and prefer a selected path
-            for downstream actions such as opening the source file.
-            """
+        def filter_hits_by_selection(hits: list, paths: set[Path]) -> list:
+            """Keep unique-content hits when any physical copy is selected."""
             filtered: list = []
             normalized_selected = {Path(path).absolute() for path in paths}
             for hit in hits:
@@ -2409,100 +2484,40 @@ class SearchFrame(wx.Frame):
                     filtered.append(hit)
             return filtered
 
-        def run_search(
-            search_mode: str,
-            progress_callback,
-        ) -> tuple[list, object, dict[str, object]]:
+        def work() -> dict[str, object]:
             if self.engine is None:
                 raise RuntimeError("Database is still loading.")
-            # Time the engine call specifically
-            t_engine_start = time.perf_counter()
+
+            engine_start = time.perf_counter()
             hits, report = self.engine.search_with_report(
                 terms,
-                search_mode,
+                term_modes=term_modes,
                 fuzzy_distance=fuzzy_distance,
                 max_distance_chars=max_distance_chars,
                 snippet_context_chars=snippet_context_chars,
                 max_results=max_results,
                 max_results_per_document=max_results_per_document,
                 case_sensitive=case_sensitive,
-                progress_callback=progress_callback,
+                progress_callback=self._queue_search_progress,
             )
-            t_engine_end = time.perf_counter()
-            
-            # Update the timing dict (thread-safe enough for this use case as it's read in done)
-            self._search_timing["search_engine"] += (t_engine_end - t_engine_start) * 1000.0
-            
-            hits = _filter_hits_by_selection(hits, selected_paths)
-            return hits, report, self._stats_from_hits(hits, report)
+            self._search_timing["search_engine"] += (
+                time.perf_counter() - engine_start
+            ) * 1000.0
 
-        def work():
-            t_work_start = time.perf_counter()
-            
-            if mode != "both":
-                hits, report, stats = run_search(
-                    mode,
-                    self._queue_search_progress,
-                )
-                
-                # Time formatting
-                t_format_start = time.perf_counter()
-                text = self._get_engine_module().format_results(
-                    hits,
-                    max_distance_chars=max_distance_chars,
-                    snippet_context_chars=snippet_context_chars,
-                    report=report if show_time_report else None,
-                )
-                t_format_end = time.perf_counter()
-                
-                self._search_timing["format_results"] += (t_format_end - t_format_start) * 1000.0
-                
-                return {
-                    "text": text,
-                    "regex": stats if mode == "regex" else None,
-                    "fuzzy": stats if mode == "fuzzy" else None,
-                    "hits": hits,
-                }
+            hits = filter_hits_by_selection(hits, selected_paths)
+            stats = self._stats_from_hits(hits, report)
 
-            if mode == "both":
-                regex_hits, regex_report, regex_stats = run_search(
-                    "regex",
-                    self._scaled_progress(self._queue_search_progress, 0.0, 0.50),
-                )
-                fuzzy_hits, fuzzy_report, fuzzy_stats = run_search(
-                    "fuzzy",
-                    self._scaled_progress(self._queue_search_progress, 0.50, 0.50),
-                )
-                engine_mod = self._get_engine_module()
-                text = "\n".join([
-                    "REGEX RESULTS",
-                    "=" * 72,
-                    engine_mod.format_results(
-                        regex_hits,
-                        max_distance_chars=max_distance_chars,
-                        snippet_context_chars=snippet_context_chars,
-                        report=regex_report if show_time_report else None,
-                    ),
-                    "",
-                    "",
-                    f"FUZZ RESULTS (edit distance <= {fuzzy_distance})",
-                    "=" * 72,
-                    engine_mod.format_results(
-                        fuzzy_hits,
-                        max_distance_chars=max_distance_chars,
-                        snippet_context_chars=snippet_context_chars,
-                        report=fuzzy_report if show_time_report else None,
-                    ),
-                ])
-            
-                return {
-                    "text": text,
-                    "regex": regex_stats,
-                    "fuzzy": fuzzy_stats,
-                    "hits": {"regex": regex_hits, "fuzzy": fuzzy_hits},
-                }
-
-
+            format_start = time.perf_counter()
+            text = self._get_engine_module().format_results(
+                hits,
+                max_distance_chars=max_distance_chars,
+                snippet_context_chars=snippet_context_chars,
+                report=report if show_time_report else None,
+            )
+            self._search_timing["format_results"] += (
+                time.perf_counter() - format_start
+            ) * 1000.0
+            return {"text": text, "stats": stats, "hits": hits}
 
         def done(result, error) -> None:
             t_done_start = time.perf_counter()
@@ -2518,25 +2533,10 @@ class SearchFrame(wx.Frame):
                 wx.MessageBox(str(error), "Search error", wx.OK | wx.ICON_ERROR)
                 return
 
-            # Update match counts per document
             self._document_match_counts.clear()
-            
-            hits_data = result.get("hits")
-            if hits_data:
-                if mode == "both":
-                    all_hits = []
-                    if isinstance(hits_data, dict):
-                        all_hits.extend(hits_data.get("regex", []))
-                        all_hits.extend(hits_data.get("fuzzy", []))
-                    else:
-                        all_hits = hits_data
-                else:
-                    all_hits = hits_data if isinstance(hits_data, list) else []
-                
-                # Count matches per document
+            all_hits = result.get("hits") or []
+            if isinstance(all_hits, list):
                 for hit in all_hits:
-                    # One hit represents unique content, but all selected copies
-                    # have the same matched text and therefore share its chain count.
                     matched_paths = hit.document.get("selected_locations") or [
                         hit.document.get("path", "")
                     ]
@@ -2544,18 +2544,14 @@ class SearchFrame(wx.Frame):
                         doc_path = str(doc_path)
                         if doc_path:
                             self._document_match_counts[doc_path] = (
-                                self._document_match_counts.get(doc_path, 0) + len(hit.chains)
+                                self._document_match_counts.get(doc_path, 0)
+                                + len(hit.chains)
                             )
 
             self._reset_stats()
-            if result["regex"] is not None:
-                self._set_stats_row(self.regex_stats, result["regex"])
-            if result["fuzzy"] is not None:
-                self._set_stats_row(self.fuzzy_stats, result["fuzzy"])
-                
-            # Time UI update
-            t_ui_start = time.perf_counter()
+            self._set_stats_row(self.search_stats, result["stats"])
 
+            ui_start = time.perf_counter()
             self._set_output_text_with_matches(
                 result["text"] or "No proximity matches found."
             )
@@ -2563,19 +2559,15 @@ class SearchFrame(wx.Frame):
             self.output.SetAnchor(0)
             self.output.ScrollToStart()
             self.output.SetFocus()
-            t_ui_end = time.perf_counter()
+            self._search_timing["ui_update"] += (
+                time.perf_counter() - ui_start
+            ) * 1000.0
 
-            self._search_timing["ui_update"] += (t_ui_end - t_ui_start) * 1000.0
-             
             self._finish_search_indicator("Search complete.", reset_delay_ms=1000)
             self.SetStatusText("Search complete.")
-            
-            # Refresh tree to show updated match counts
             self._update_tree_results()
 
-            # Preserve the completed, selection-filtered search result state for
-            # the modeless Document Browser. If it is already open, refresh it
-            # immediately so it continues to represent the last search.
+            # The Document Browser now always receives one unified hit list.
             self._last_search_hits = result.get("hits")
             self.btn_document_browser.Enable(bool(self._last_search_hits))
             if self._document_browser is not None:
@@ -2588,20 +2580,18 @@ class SearchFrame(wx.Frame):
                 except RuntimeError:
                     self._document_browser = None
 
-            # Calculate total and log
-            t_done_end = time.perf_counter()
-            total_ms = (t_done_end - t_start) * 1000.0
+            total_ms = (time.perf_counter() - t_start) * 1000.0
             self._search_timing["total"] = total_ms
-            
-            # Print detailed breakdown to console/debug log
-            print(f"--- SEARCH TIMING BREAKDOWN ---")
+            print("--- SEARCH TIMING BREAKDOWN ---")
             print(f"Total Time: {total_ms:.2f} ms")
             print(f"Engine Search: {self._search_timing['search_engine']:.2f} ms")
             print(f"Format Results: {self._search_timing['format_results']:.2f} ms")
             print(f"UI Update (SetText/Styling): {self._search_timing['ui_update']:.2f} ms")
-            print(f"Other/Overhead: {total_ms - self._search_timing['search_engine'] - self._search_timing['format_results'] - self._search_timing['ui_update']:.2f} ms")
+            print(
+                "Other/Overhead: "
+                f"{total_ms - self._search_timing['search_engine'] - self._search_timing['format_results'] - self._search_timing['ui_update']:.2f} ms"
+            )
             print("---------------------------")
-
 
         self._run_background(work, done)
 
