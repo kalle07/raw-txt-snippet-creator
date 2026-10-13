@@ -25,11 +25,11 @@ https://github.com/kalle07/pdf2txt-parser
 # Hints
 * Only windows tested!
 * Only txt files, tested with several 2MB (several large books)
-* Choose txt file or copy all txt files into sup folder "txt"
+* Choose txt file or copy all txt files into sub folder "txt", you can also create  folders there
 * Type one keyword or more
 * Max_Distance_Chars - is the max distance between the keywords in characters
-* Snippet_Conext_Chars - number of characters before and after the last word found
-* Two search options "usual exact + wildcard" and "fuzzy-search"<br>
+* Snippet_Conext_Chars - number of characters before and after the last word found for better content
+* Two search options "usual exact/regex + wildcard" and "fuzzy-search"<br>
 (wildcard search If you have the word “friendship” and search for “friend” it will not be found. You should use “friend*”. "?" is only one character like usual.)<br>
 (fuzzy search is sometime usefully , "1" means one characater replacement -> small typos / minor variations; fuzzy 2 most times a lot of words are found)
 * Now you can easily copy and paste to your chat
