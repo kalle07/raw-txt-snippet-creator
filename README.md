@@ -16,7 +16,8 @@ The maximum text found is never larger than the original text, as overlapping se
 - Phrase search implemented
 - Case-sensitive implemented
 - document result browser implemented, right click save snippets
--> A new index should be created in the new version, so there is no backward compatibility
+
+-> A new index should be created at new versions, so there is no backward compatibility
 
 Best in combination with my PDF Parser:
 https://github.com/kalle07/pdf2txt-parser
