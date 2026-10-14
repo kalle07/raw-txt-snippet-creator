@@ -1,0 +1,6 @@
+wxPython>=4.2.0
+lancedb
+numpy
+pyarrow
+rapidfuzz
+watchdog>=3.0.0
