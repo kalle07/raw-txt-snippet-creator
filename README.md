@@ -10,6 +10,9 @@ https://github.com/kalle07/raw-txt-snippet-creator/releases/download/_v02/TextSe
 Search large collections of plain-text books and documents from a
 desktop app.
 
+<img width="2239" height="1259" alt="grafik" src="https://github.com/user-attachments/assets/1c323d1e-4588-40e4-a500-ab9fdfb081c5" />
+
+
 Instead of opening files one by one, enter up to **three keywords** and
 find passages where they occur close together. The app extracts readable
 snippets around matches, so you can quickly review relevant passages and
