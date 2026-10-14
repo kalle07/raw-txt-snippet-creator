@@ -4,20 +4,20 @@
 https://github.com/kalle07/raw-txt-snippet-creator/releases/download/_v02/TextSearch-by-kalle07.exe
 
 up to 3 keywords linked by <b>and</b> and you can seach within distance. Its like an embedder only with plain txt search!<br>
-It's like opening a text editor, searching for a keyword, and finding X hits. Now the snippet extractor cuts out a section around each keyword and show it.<br>
-Copy the EXE file to a folder of your choice. When you run it for the first time, the program will create the database and the TXT folder. You can now select text files or copy TXT files directly into the folder.<br>
+It's like opening a text editor, searching for a keyword, and finding X hits. Now the snippet extractor cuts out a section around each keyword and show it. This in advance can searc hfor several keywords in close range!<br>
+Copy the EXE file to a folder of your choice. When you run it for the first time, the program will create the database and the TXT folder. You can now select text files or copy TXT files directly into the folder and "index new files".<br>
 The maximum text found is never larger than the original text, as overlapping sections are merged!<br>
 -> All is in characters
 -> Keep in mind 4000 characters ~1000token (aprox one book page)
--> Can handle large amount of data
--> Will be once indexed first, 10 big books need ~5-10sec
+-> Can handle large amount of data (1000 txt files)
+-> Will be once indexed first, (10 big books need ~5-10sec)
 -> Load database at start < 1sec
 -> Usual search need < 100ms
 - Phrase search implemented
 - Case-sensitive implemented
 - document result browser implemented, right click save snippets
 
--> A new index should be created at new versions, so there is no backward compatibility
+-> A new index should be created at new versions (delete folder "text_search.lancedb" to be safe), so there is no backward compatibility
 
 Best in combination with my PDF Parser:
 https://github.com/kalle07/pdf2txt-parser
