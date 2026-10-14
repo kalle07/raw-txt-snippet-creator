@@ -269,6 +269,8 @@ class DocumentBrowserFrame(wx.Frame):
         self,
         parent: wx.Window,
         search_hits: Sequence[Any] | dict[str, Sequence[Any]] | None,
+        *,
+        snippet_context_chars: int = 200,
     ) -> None:
         super().__init__(
             parent,
@@ -278,6 +280,7 @@ class DocumentBrowserFrame(wx.Frame):
         )
 
         self._parent = parent
+        self._snippet_context_chars = snippet_context_chars
         self._documents: list[BrowserDocument] = []
 
         self._selected_index = -1
@@ -676,7 +679,7 @@ class DocumentBrowserFrame(wx.Frame):
 
         try:
             report_path.write_text(
-                self._build_chain_report(document),
+                self._build_chain_report(document, self._snippet_context_chars),
                 encoding="utf-8",
                 newline="\n",
             )
@@ -696,10 +699,23 @@ class DocumentBrowserFrame(wx.Frame):
             self,
         )
 
+
     @staticmethod
-    def _build_chain_report(document: BrowserDocument) -> str:
-        """Format metadata and one complete text excerpt per result chain."""
-        lines = [
+    def _build_chain_report(
+        document: BrowserDocument,
+        snippet_context_chars: int = 200,
+    ) -> str:
+        """Format metadata and context-padded text for every result chain.
+
+        Each chain excerpt is expanded by ``snippet_context_chars`` on both sides
+        (clamped to the document boundaries).  Newline and carriage-return
+        characters are replaced with a single space so the saved file contains
+        no visible ``\\n`` or ``\\r`` sequences.
+        """
+        content = document.content
+        content_len = len(content)
+
+        lines: list[str] = [
             f"Document: {document.filename}",
             f"Source path: {document.path}",
             f"Result chains: {document.result_count}",
@@ -710,13 +726,12 @@ class DocumentBrowserFrame(wx.Frame):
         if document.metadata:
             for key in sorted(document.metadata):
                 value = document.metadata[key]
-                # Keep metadata readable and prevent embedded newlines from
-                # making one field look like multiple metadata entries.
                 lines.append(f"  {key}: {value!r}")
         else:
             lines.append("  (No additional document metadata available.)")
 
-        lines.extend(("", "Found chains:", ""))
+        lines.extend(["", "Found chains:", ""])
+
         if not document.chains:
             lines.append("(No chains found.)")
             return "\n".join(lines) + "\n"
@@ -729,25 +744,34 @@ class DocumentBrowserFrame(wx.Frame):
                     end = int(item.get("end", start))
                 except (AttributeError, TypeError, ValueError):
                     continue
-                if 0 <= start <= end <= len(document.content):
+                if 0 <= start <= end <= content_len:
                     valid_positions.append((start, end))
 
             if not valid_positions:
-                lines.append(f"Chain {chain_number} [position unavailable]: (text unavailable)")
+                lines.append(f"Chain {chain_number} [start=0, end=0]: (text unavailable)")
+                lines.append("")
                 continue
 
-            # Save the entire source span covered by the chain, not one line
-            # per term. The reported position points to the first term only.
-            chain_start = min(start for start, _end in valid_positions)
-            chain_end = max(end for _start, end in valid_positions)
-            line_number = document.content.count("\n", 0, chain_start) + 1
-            previous_newline = document.content.rfind("\n", 0, chain_start)
-            column_number = chain_start - previous_newline
-            position = f"[term at char {chain_start + 1}; line {line_number}, column {column_number}]"
-            chain_text = document.content[chain_start:chain_end]
-            lines.append(f"Chain {chain_number} {position}: {chain_text!r}")
+            chain_start = min(s for s, _e in valid_positions)
+            chain_end = max(e for _s, e in valid_positions)
+
+            # Expand by context on both sides, clamped to document bounds.
+            expanded_start = max(0, chain_start - snippet_context_chars)
+            expanded_end = min(content_len, chain_end + snippet_context_chars)
+
+            # Replace \n and \r with a single space so no visible escape chars remain.
+            raw_text = content[expanded_start:expanded_end]
+            # display_text = raw_text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+            display_text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+
+            lines.append(
+                f"Chain {chain_number} [start={chain_start}, end={chain_end}]: "
+                f"{display_text}\n\n---"
+            )
+            lines.append("")
 
         return "\n".join(lines).rstrip() + "\n"
+
 
     def _open_source_path(self, index: int) -> None:
         """Open the source document's containing folder in the file manager."""
@@ -1209,7 +1233,14 @@ class DocumentBrowserFrame(wx.Frame):
                 except (TypeError, ValueError):
                     continue
 
+            # Include the context-expanded boundaries so CHAIN_STYLE can reach
+            # snippet_context_chars beyond the chain's first/last term.
+            chain_start, chain_end = self._chain_span(chain)
+            targets.append(max(0, chain_start - self._snippet_context_chars))
+            targets.append(min(len(document.content), chain_end + self._snippet_context_chars))
+
         return targets
+
 
     def _apply_base_highlighting(
         self,
@@ -1222,11 +1253,13 @@ class DocumentBrowserFrame(wx.Frame):
             0,
         )
 
-        # Subtle background for every full chain span.
+        content_len = len(document.content)
         for chain in document.chains:
             chain_start, chain_end = self._chain_span(chain)
-            chain_byte_start = self._prefix_targets.get(chain_start)
-            chain_byte_end = self._prefix_targets.get(chain_end)
+            expanded_start = max(0, chain_start - self._snippet_context_chars)
+            expanded_end = min(content_len, chain_end + self._snippet_context_chars)
+            chain_byte_start = self._prefix_targets.get(expanded_start)
+            chain_byte_end = self._prefix_targets.get(expanded_end)
 
             if (
                 chain_byte_start is None
@@ -1275,10 +1308,13 @@ class DocumentBrowserFrame(wx.Frame):
 
             chain = document.chains[self._result_index]
 
-            # Subtle background for the entire span of the active chain.
+            # Subtle background for the active chain span (± context).
+            content_len = len(document.content)
             chain_start, chain_end = self._chain_span(chain)
-            chain_byte_start = self._prefix_targets.get(chain_start)
-            chain_byte_end = self._prefix_targets.get(chain_end)
+            expanded_start = max(0, chain_start - self._snippet_context_chars)
+            expanded_end = min(content_len, chain_end + self._snippet_context_chars)
+            chain_byte_start = self._prefix_targets.get(expanded_start)
+            chain_byte_end = self._prefix_targets.get(expanded_end)
 
             if (
                 chain_byte_start is not None

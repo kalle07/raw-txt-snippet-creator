@@ -108,12 +108,6 @@ LANCE_CLEANUP_EVERY_STARTS = 20
 LANCE_CLEANUP_RETENTION = timedelta(days=7)
 LANCE_MAINTENANCE_STATE_FILE = ".lancedb_maintenance.json"
 
-# While the app is open, cheaply check directory/file metadata between searches.
-# Content hashes are rechecked immediately after a metadata change, and all files
-# receive a full SHA-256 verification every five minutes while searches are active.
-SEARCH_FOLDER_STAT_CHECK_INTERVAL_SECONDS = 2.0
-SEARCH_FOLDER_FULL_HASH_CHECK_INTERVAL_SECONDS = 300.0
-
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.INFO)
@@ -186,17 +180,29 @@ _ADDITIONAL_TOKEN_WRAPPER_PAIRS = {
     "(": ")",
     "[": "]",
     "{": "}",
+    "<": ">",
     "«": "»",
     "„": "“",
     "“": "”",
     "‘": "’",
+    "‚": "’",
+    "❞": "❝",
+    "＂": "＂",
+    "‹": "›",
     "〝": "〞",
-    "〝": "〝",
-    "〞": "〝",
-    "〞": "〞",
+    "″": "″",
+    "〈": "〉",
+    "｛": "｝",
+    "（": "）",
+    "❮": "❯",
+    "❰": "❱",
     "❮": "❯",
     "❝": "❞",
-    '"': '"',    
+    "⟨": "⟩",
+    '"': '"',
+    "'": "'",
+    "`": "`",
+    "′": "′",
 }
 
 
@@ -4025,8 +4031,6 @@ class TextSearchEngine:
         self.search_folder.mkdir(parents=True, exist_ok=True)
         self._index_lock = threading.RLock()
         self._folder_snapshot: dict[str, tuple[int, int]] = {}
-        self._last_folder_stat_check = 0.0
-        self._last_full_integrity_check = 0.0
         _notify_progress(progress_callback, "Opening database", 0.05)
         self.db = lancedb.connect(str(self.db_path))
         self._maintenance_modifications = self._load_maintenance_modifications()
@@ -4100,7 +4104,7 @@ class TextSearchEngine:
             return
 
         sources: list[Path] = []
-        deleted_folder = (self.search_folder / "deleted").absolute()
+        deleted_folder = (self.search_folder.parent / "deleted").absolute()
         # Include all managed files; a failed recursive scan must abort migration.
         current, _snapshot = scan_search_folder(self.search_folder, deleted_folder)
         sources.extend(current)
@@ -4319,7 +4323,7 @@ class TextSearchEngine:
         ) = build_runtime_search_caches(self.index.docs, self.index.locations)
 
     def _rebuild_sources(self, extra_paths: list[Path]) -> list[Path]:
-        deleted_folder = (self.search_folder / "deleted").absolute()
+        deleted_folder = (self.search_folder.parent / "deleted").absolute()
         # Use the same complete, fail-closed scan as normal synchronization. This
         # also handles .TXT on case-sensitive filesystems and never mistakes a
         # traversal error for an empty folder.
@@ -4451,7 +4455,7 @@ class TextSearchEngine:
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, int]:
         with self._index_lock:
-            deleted_folder = (self.search_folder / "deleted").absolute()
+            deleted_folder = (self.search_folder.parent / "deleted").absolute()
             normalized = collect_paths(
                 [
                     Path(path)
@@ -4510,18 +4514,18 @@ class TextSearchEngine:
         trusted_unchanged_paths: set[str] | None = None,
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, int]:
-        """Reconcile one complete scan, then publish its metadata snapshot."""
+        """Reconcile a scanned folder and publish its metadata snapshot.
+
+        Only paths whose metadata changed since the last successful startup or
+        explicit indexing operation are SHA-256 checked. Startup begins with an
+        empty snapshot and therefore verifies every source file.
+        """
         current_strings = {str(path) for path in current}
-        full_integrity_check = trusted_unchanged_paths is None or not trusted_unchanged_paths
 
         if self.index is None or not index_schema_is_valid(self.db):
             self._ensure_ready(current, progress_callback=progress_callback)
-            full_integrity_check = True
             result = self._bulk_build_result()
         else:
-            # If the schema exists but has no indexed content, use the same bulk
-            # builder as a missing/invalid database. This avoids the incremental
-            # route's separate SHA pass, per-table delta writes, and FTS refresh.
             current_document_count = int(self.index.docs.count_rows())
             if current and current_document_count == 0:
                 logger.info(
@@ -4529,12 +4533,9 @@ class TextSearchEngine:
                     len(current),
                 )
                 self._rebuild_and_activate(current, progress_callback=progress_callback)
-                full_integrity_check = True
                 result = self._bulk_build_result()
             else:
                 old = query_rows(self.index.locations, columns=["path"])
-                # Every physical path is tracked, including copies that do not match
-                # the representative compatibility path stored in DOCS.
                 managed_old = {
                     str(Path(row["path"]).absolute())
                     for row in old
@@ -4552,10 +4553,6 @@ class TextSearchEngine:
                 self._record_maintenance_modifications(changed)
 
         self._folder_snapshot = dict(snapshot)
-        now = time.monotonic()
-        self._last_folder_stat_check = now
-        if full_integrity_check:
-            self._last_full_integrity_check = now
         return result
 
     def sync_search_folder(
@@ -4563,95 +4560,28 @@ class TextSearchEngine:
         *,
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, int]:
-        """Fully hash and reconcile all .txt files under the search folder.
+        """Synchronize the text folder when startup or manual indexing requests it.
 
-        The `deleted` subtree is always excluded. A failed/incomplete scan aborts
-        before any document is removed from the index.
+        The folder is enumerated to find additions, removals, renames and metadata
+        changes. Paths whose mtime and size match the last successful synchronization
+        reuse their stored SHA-256. The initial startup snapshot is empty, forcing a
+        full hash verification. This method is never called by background monitoring
+        or automatically before a search.
         """
         with self._index_lock:
-            current, snapshot = scan_search_folder(
-                self.search_folder,
-                self.search_folder / "deleted",
-            )
+            deleted_folder = self.search_folder.parent / "deleted"
+            current, snapshot = scan_search_folder(self.search_folder, deleted_folder)
+            trusted_unchanged_paths = {
+                path_str
+                for path_str, metadata in snapshot.items()
+                if self._folder_snapshot.get(path_str) == metadata
+            }
             return self._sync_scanned_folder(
                 current,
                 snapshot,
+                trusted_unchanged_paths=trusted_unchanged_paths,
                 progress_callback=progress_callback,
             )
-
-    def _check_search_folder_before_search(
-        self,
-        *,
-        progress_callback: ProgressCallback | None = None,
-    ) -> None:
-        """Check for changes while the app is active without hashing on each query.
-
-        File metadata is scanned at most every couple of seconds. Any metadata or
-        path change triggers full SHA-256 reconciliation. A periodic full hash pass
-        also catches edits where size/mtime were deliberately preserved.
-        """
-        if self.index is None:
-            return
-
-        now = time.monotonic()
-        full_due = (
-            self._last_full_integrity_check <= 0.0
-            or now - self._last_full_integrity_check
-            >= SEARCH_FOLDER_FULL_HASH_CHECK_INTERVAL_SECONDS
-        )
-        stat_due = (
-            self._last_folder_stat_check <= 0.0
-            or now - self._last_folder_stat_check
-            >= SEARCH_FOLDER_STAT_CHECK_INTERVAL_SECONDS
-        )
-        if not full_due and not stat_due:
-            return
-
-        with self._index_lock:
-            now = time.monotonic()
-            full_due = (
-                self._last_full_integrity_check <= 0.0
-                or now - self._last_full_integrity_check
-                >= SEARCH_FOLDER_FULL_HASH_CHECK_INTERVAL_SECONDS
-            )
-            stat_due = (
-                self._last_folder_stat_check <= 0.0
-                or now - self._last_folder_stat_check
-                >= SEARCH_FOLDER_STAT_CHECK_INTERVAL_SECONDS
-            )
-            if not full_due and not stat_due:
-                return
-            try:
-                current, snapshot = scan_search_folder(
-                    self.search_folder,
-                    self.search_folder / "deleted",
-                )
-                self._last_folder_stat_check = time.monotonic()
-                if full_due or snapshot != self._folder_snapshot:
-                    trusted_unchanged_paths = None
-                    if not full_due:
-                        trusted_unchanged_paths = {
-                            path_str
-                            for path_str, metadata in snapshot.items()
-                            if self._folder_snapshot.get(path_str) == metadata
-                        }
-                    self._sync_scanned_folder(
-                        current,
-                        snapshot,
-                        trusted_unchanged_paths=trusted_unchanged_paths,
-                        progress_callback=progress_callback,
-                    )
-                else:
-                    self._folder_snapshot = dict(snapshot)
-            except Exception:
-                # A query should still be allowed with the last known-good index.
-                # Failed scans/syncs must not advance the trusted snapshot or
-                # remove documents from the persistent index.
-                self._last_folder_stat_check = time.monotonic()
-                logger.exception(
-                    "Automatic text-folder check failed; search will use the last known-good index"
-                )
-
 
     def reset_database(
         self,
@@ -4694,7 +4624,7 @@ class TextSearchEngine:
                 raise ValueError("Unknown database reset action.")
 
             search_folder = self.search_folder.absolute()
-            deleted_folder = search_folder / "deleted"
+            deleted_folder = search_folder.parent / "deleted"
 
             # Scan first, and abort before mutating anything if the directory scan
             # is incomplete. Include still-existing indexed source files outside
@@ -4815,8 +4745,6 @@ class TextSearchEngine:
             refresh_index_caches()
 
             self._folder_snapshot = {}
-            self._last_folder_stat_check = 0.0
-            self._last_full_integrity_check = 0.0
             self._maintenance_modifications = 0
             self._save_maintenance_modifications()
             debug("EMPTY INDEX READY")
@@ -4939,7 +4867,7 @@ class TextSearchEngine:
             result = delete_document(
                 self.index,
                 int(doc_id),
-                self.search_folder / "deleted",
+                self.search_folder.parent / "deleted",
                 path=path,
                 progress_callback=progress_callback,
                 move_source=move_source,
@@ -4969,7 +4897,6 @@ class TextSearchEngine:
         progress_callback: ProgressCallback | None = None,
     ) -> tuple[list[SearchHit], SearchReport]:
         with self._index_lock:
-            self._check_search_folder_before_search(progress_callback=progress_callback)
             if self.index is None:
                 return [], SearchReport(mode=mode)
 

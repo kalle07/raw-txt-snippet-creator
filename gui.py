@@ -17,6 +17,36 @@ import wx
 import wx.dataview as dv
 import wx.stc as stc
 
+try:
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+except ImportError:  # keep startup usable and report that live monitoring is unavailable
+    Observer = None
+
+    class FileSystemEventHandler:  # type: ignore[no-redef]
+        pass
+
+
+class _SearchFolderEventHandler(FileSystemEventHandler):
+    """Forward relevant Watchdog notifications to the GUI thread."""
+
+    def __init__(self, callback) -> None:
+        super().__init__()
+        self._callback = callback
+
+    def on_any_event(self, event) -> None:
+        event_type = str(getattr(event, "event_type", ""))
+        if event_type not in {"created", "modified", "moved", "deleted"}:
+            return
+        if bool(getattr(event, "is_directory", False)) and event_type == "modified":
+            return
+        self._callback(
+            event_type,
+            str(getattr(event, "src_path", "")),
+            str(getattr(event, "dest_path", "") or ""),
+            bool(getattr(event, "is_directory", False)),
+        )
+
 # Keep startup lightweight: do not import engine.py here. It imports LanceDB,
 # PyArrow, NumPy and RapidFuzz and is intentionally loaded after the first
 # wx frame has been painted.
@@ -122,15 +152,31 @@ class SearchFrame(wx.Frame):
         self._index_reset_timer = None
 
         self._tree_context_event_bound = False
-        self._folder_timer = wx.Timer(self)
+        self._tree_refresh_timer = wx.Timer(self)
         self._search_progress_timer = wx.Timer(self)
+        self._index_needed_status_timer = wx.Timer(self)
+        self._index_needed_paths: set[str] = set()
+        self._index_needed_status_count = 0
+        self._index_needed_status_visible = False
+        self._watchdog_observer = None
+        self._closing = False
+        self._watch_generation = 0
+        self._monitor_dirty_paths: set[str] = set()
+        self._indexed_source_paths: set[str] = set()
+        self._watchdog_event_lock = threading.Lock()
+        self._watchdog_dispatch_scheduled = False
+        self._watchdog_force_tree_scan = False
+        self._watchdog_changed_files: set[str] = set()
+        self._watchdog_dirty_additions: set[str] = set()
+        self._watchdog_dirty_removals: set[str] = set()
+        self._watchdog_dirty_prefix_removals: set[str] = set()
+        self._tree_refresh_running = False
+        self._tree_refresh_pending = False
+        self._tree_items_by_path: dict[str, dv.TreeListItem] = {}
+        self._tree_check_propagating = False
+        self._tree_file_paths: set[str] = set()
         self._search_progress_mode = "regex"
         self._search_reset_timer = None
-        # Snapshot of the files actually synchronized with the database.
-        self._folder_snapshot: dict[str, tuple[int, int]] = {}
-        # Separate snapshot used only to avoid refreshing the tree repeatedly
-        # while the user has not yet indexed externally added/changed files.
-        self._folder_view_snapshot: dict[str, tuple[int, int]] = {}
         self._keyword_fields: list[wx.TextCtrl] = []
         self._regex_search_fields: list[wx.CheckBox] = []
         self._fuzzy_search_fields: list[wx.CheckBox] = []
@@ -147,11 +193,13 @@ class SearchFrame(wx.Frame):
         self.SetStatusText("Loading database ...")
         self.Centre()
 
-        self.Bind(wx.EVT_TIMER, self._on_folder_timer, self._folder_timer)
+        self.Bind(wx.EVT_TIMER, self._on_tree_refresh_timer, self._tree_refresh_timer)
         self.Bind(wx.EVT_TIMER, self._on_search_progress_timer, self._search_progress_timer)
+        self.Bind(wx.EVT_TIMER, self._on_index_needed_status_timer, self._index_needed_status_timer)
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
         self.Bind(wx.EVT_CLOSE, self._on_close)
-        self._folder_timer.Start(3000)
+        # Ensure Watchdog has an existing root to observe even before the engine loads.
+        Path(SEARCH_FOLDER).absolute().mkdir(parents=True, exist_ok=True)
 
 
     def _set_database_action_state(self, ready: bool) -> None:
@@ -229,11 +277,6 @@ class SearchFrame(wx.Frame):
             return
 
         self._refresh_tree()
-        # The manual-index snapshot must come from the database, not from the
-        # filesystem. Files added before startup may exist on disk without being
-        # indexed yet and must therefore remain visible to the Index button.
-        self._folder_snapshot = self._indexed_folder_state()
-        self._folder_view_snapshot = self._folder_state()
 
         # Show completed index progress briefly, then reset it.
         self._update_index_progress(1.0, "Database ready")
@@ -247,6 +290,7 @@ class SearchFrame(wx.Frame):
             else "No indexed database yet."
         )
         self.btn_search.Enable(self.engine.has_index)
+        self._start_filesystem_monitor()
 
     def _get_engine_module(self):
         if self._engine_module is None:
@@ -335,6 +379,37 @@ class SearchFrame(wx.Frame):
         
       
         self.tree.AppendColumn("Results", width=50)
+
+        # Use the platform's standard wx art for folders and files. Keep the
+        # image list alive on the frame for the lifetime of the tree control.
+        self._tree_image_list = wx.ImageList(16, 16, True)
+
+        def _stock_bitmap(art_id: str):
+            bitmap = wx.ArtProvider.GetBitmap(art_id, wx.ART_OTHER, wx.Size(16, 16))
+            if bitmap.IsOk():
+                return bitmap
+            # Cross-platform fallback IDs if a port does not supply an art item.
+            fallbacks = (
+                (wx.ART_FOLDER_OPEN, wx.ART_NORMAL_FILE)
+                if art_id == wx.ART_FOLDER
+                else (wx.ART_FILE_OPEN, wx.ART_FOLDER)
+            )
+            for fallback_id in fallbacks:
+                try:
+                    bitmap = wx.ArtProvider.GetBitmap(
+                        fallback_id, wx.ART_OTHER, wx.Size(16, 16)
+                    )
+                    if bitmap.IsOk():
+                        return bitmap
+                except Exception:
+                    pass
+            raise RuntimeError(f"No standard wx bitmap available for {art_id!r}")
+
+        folder_bitmap = _stock_bitmap(wx.ART_FOLDER)
+        file_bitmap = _stock_bitmap(wx.ART_NORMAL_FILE)
+        self._tree_folder_icon = self._tree_image_list.Add(folder_bitmap)
+        self._tree_file_icon = self._tree_image_list.Add(file_bitmap)
+        self.tree.SetImageList(self._tree_image_list)
 
         self.tree.Bind(dv.EVT_TREELIST_ITEM_CHECKED, self._on_tree_checked)
  
@@ -566,7 +641,10 @@ class SearchFrame(wx.Frame):
         root.Add(result_box, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
         panel.SetSizer(root)
-        self.CreateStatusBar()
+        # Keep ordinary status messages intact in field 0. The separate right-hand
+        # field is reserved for the flashing unindexed-file count.
+        self.CreateStatusBar(2)
+        self.GetStatusBar().SetStatusWidths([-1, 190])
         self._reset_stats()
 
     @staticmethod
@@ -832,156 +910,276 @@ class SearchFrame(wx.Frame):
         return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
-    def _populate_tree(self) -> None:
-        """Reconcile the tree with current SEARCH_FOLDER contents and pending files.
+    @staticmethod
+    def _status_path_key(path: str | Path) -> str:
+        """Normalize a path for the index-needed status count set."""
+        return os.path.normcase(os.path.abspath(str(path)))
 
-        Preserves checkbox state on unchanged items by updating in-place rather
-        than rebuilding from scratch.
+    def _set_index_needed_status_count(self, count: int) -> None:
+        """Flash a separate status-bar field while files need indexing."""
+        count = max(0, int(count))
+        if count == self._index_needed_status_count:
+            # Keep the displayed number current if the flash is currently visible.
+            if count and self._index_needed_status_visible:
+                self.GetStatusBar().SetStatusText(f"INDEX NEEDED: {count:,}", 1)
+            return
+
+        self._index_needed_status_count = count
+        status_bar = self.GetStatusBar()
+        if count == 0:
+            if self._index_needed_status_timer.IsRunning():
+                self._index_needed_status_timer.Stop()
+            self._index_needed_status_visible = False
+            status_bar.SetStatusText("", 1)
+            return
+
+        # Show the warning immediately, then alternate it with a blank field.
+        self._index_needed_status_visible = True
+        status_bar.SetStatusText(f"INDEX NEEDED: {count:,}", 1)
+        if not self._index_needed_status_timer.IsRunning():
+            self._index_needed_status_timer.Start(650)
+
+    def _on_index_needed_status_timer(self, _event: wx.TimerEvent) -> None:
+        if self._index_needed_status_count <= 0:
+            self._index_needed_status_timer.Stop()
+            self._index_needed_status_visible = False
+            self.GetStatusBar().SetStatusText("", 1)
+            return
+        self._index_needed_status_visible = not self._index_needed_status_visible
+        text = (
+            f"INDEX NEEDED: {self._index_needed_status_count:,}"
+            if self._index_needed_status_visible
+            else ""
+        )
+        self.GetStatusBar().SetStatusText(text, 1)
+
+    def _populate_tree(self) -> None:
+        """Collect the current tree state off-thread, then reconcile on the GUI thread.
+
+        This is called at startup, after explicit user operations, and in response
+        to Watchdog notifications. There is no periodic filesystem scan.
         """
         if self.engine is None:
-            # During initial load, just show a placeholder
             self.tree.DeleteAllItems()
+            self._tree_items_by_path.clear()
+            self._tree_file_paths.clear()
+            self._indexed_source_paths.clear()
+            self._index_needed_paths.clear()
+            self._set_index_needed_status_count(0)
             root = self.tree.GetRootItem()
             self.tree.AppendItem(root, "Loading index …")
             return
 
+        if self._tree_refresh_running:
+            self._tree_refresh_pending = True
+            return
+
+        self._tree_refresh_running = True
+        engine = self.engine
         folder = Path(SEARCH_FOLDER).absolute()
-        indexed: dict[str, dict] = {
-            str(Path(row["path"]).absolute()): row
-            for row in self.engine.list_documents()
-        }
-        pending: set[Path] = set(self.pending_paths)
+        pending = {Path(p).absolute() for p in self.pending_paths}
+        pending_strings = {str(path) for path in pending}
+        dirty_paths = set(self._monitor_dirty_paths)
+        engine_module = self._engine_module
 
-        # Build the desired state: map of absolute_path -> (name, size_str, word_count_str, status_text)
-        desired_files: dict[str, tuple[str, str, str, str]] = {}
+        def collect_tree_state():
+            indexed: dict[str, dict] = {
+                str(Path(row["path"]).absolute()): row
+                for row in engine.list_documents()
+            }
+            desired_files: dict[str, tuple[str, str, str, str]] = {}
+            desired_dirs: dict[str, str] = {}
 
-        # External pending files (outside search folder)
-        external_paths = sorted(
-            p for p in pending if not self._inside(p, folder)
-        )
-        for path in external_paths:
-            status_text = "Pending" if str(path.absolute()) not in indexed else "Indexed"
-            try:
-                size_str = self._format_size(int(path.stat().st_size))
-            except OSError:
-                size_str = "—"
-            word_count_str = "—"
-            if path.suffix.casefold() == ".txt":
-                try:
-                    content = path.read_text(encoding="utf-8", errors="ignore")
-                    wc = self._get_engine_module().count_words(content)
-                    word_count_str = str(wc) if wc is not None else "—"
-                except (OSError, RuntimeError):
-                    word_count_str = "—"
-            desired_files[str(path.absolute())] = (
-                path.name, size_str, word_count_str, status_text
+            # External files enter the tree only when explicitly selected/copied.
+            external_paths = sorted(
+                (p for p in pending if not self._inside(p, folder)
+                 and not self._is_deleted_path(p, folder)),
+                key=lambda p: str(p).casefold(),
             )
-
-        # Files inside SEARCH_FOLDER
-        try:
-            entries = sorted(folder.rglob("*.txt"), key=lambda p: str(p).casefold())
-        except OSError:
-            entries = []
-
-        for entry in entries:
-            if self._is_deleted_path(entry, folder):
-                continue
-            abs_path = str(entry.absolute())
-            if abs_path in indexed:
-                status_text = "Indexed" if entry.exists() else "MISSING"
-                wc = indexed[abs_path].get("word_count")
-                word_count_str = str(wc) if wc is not None else "—"
-            elif entry in pending or abs_path in {str(p) for p in pending}:
-                status_text = "Pending"
+            for path in external_paths:
+                abs_path = str(path.absolute())
+                is_indexed = abs_path in indexed
+                status_text = "Indexed" if is_indexed else "Pending"
                 try:
-                    content = entry.read_text(encoding="utf-8", errors="ignore")
-                    wc = self._get_engine_module().count_words(content)
-                    word_count_str = str(wc) if wc is not None else "—"
-                except (OSError, RuntimeError):
-                    word_count_str = "—"
-            else:
-                status_text = "Not indexed"
+                    size_str = self._format_size(int(path.stat().st_size))
+                except OSError:
+                    size_str = "—"
                 word_count_str = "—"
+                if path.suffix.casefold() == ".txt" and engine_module is not None:
+                    try:
+                        content = path.read_text(encoding="utf-8", errors="ignore")
+                        wc = engine_module.count_words(content)
+                        word_count_str = str(wc) if wc is not None else "—"
+                    except (OSError, RuntimeError):
+                        word_count_str = "—"
+                desired_files[abs_path] = (path.name, size_str, word_count_str, status_text)
 
+            # Enumerate recursively but never descend into or filter a directory
+            # merely because it is named "deleted". The deleted archive is now a
+            # sibling of txt, so every descendant of txt is searchable.
+            for root_dir, dir_names, file_names in os.walk(folder, topdown=True, followlinks=False):
+                dir_names.sort(key=str.casefold)
+                file_names.sort(key=str.casefold)
+                dir_path = Path(root_dir).absolute()
+                try:
+                    dir_size = self._format_size(int(dir_path.stat().st_size))
+                except OSError:
+                    dir_size = "—"
+                desired_dirs[str(dir_path)] = dir_size
+
+                for file_name in file_names:
+                    path = dir_path / file_name
+                    if path.suffix.casefold() != ".txt":
+                        continue
+                    abs_path = str(path.absolute())
+                    row = indexed.get(abs_path)
+                    is_pending = path.absolute() in pending or abs_path in pending_strings
+                    if row is not None:
+                        status_text = (
+                            "Changed — index needed"
+                            if abs_path in dirty_paths
+                            else "Indexed"
+                        )
+                        wc = row.get("word_count")
+                        word_count_str = str(wc) if wc is not None else "—"
+                    elif is_pending:
+                        status_text = "Pending"
+                        word_count_str = "—"
+                        if engine_module is not None:
+                            try:
+                                content = path.read_text(encoding="utf-8", errors="ignore")
+                                wc = engine_module.count_words(content)
+                                word_count_str = str(wc) if wc is not None else "—"
+                            except (OSError, RuntimeError):
+                                pass
+                    else:
+                        status_text = "Not indexed"
+                        word_count_str = "—"
+                    try:
+                        size_str = self._format_size(int(path.stat().st_size))
+                    except OSError:
+                        size_str = "—"
+                    desired_files[abs_path] = (
+                        path.name, size_str, word_count_str, status_text
+                    )
+            return desired_files, desired_dirs, set(indexed)
+
+        def worker() -> None:
             try:
-                size_str = self._format_size(int(entry.stat().st_size))
-            except OSError:
-                size_str = "—"
+                desired_files, desired_dirs, indexed_paths = collect_tree_state()
+                wx.CallAfter(
+                    self._apply_tree_state,
+                    desired_files,
+                    desired_dirs,
+                    indexed_paths,
+                    None,
+                )
+            except Exception as exc:
+                wx.CallAfter(self._apply_tree_state, None, None, None, exc)
 
-            desired_files[abs_path] = (entry.name, size_str, word_count_str, status_text)
+        threading.Thread(target=worker, name="tree-state-scan", daemon=True).start()
 
-        # Now reconcile the tree
-        self._reconcile_tree(desired_files)
+    def _apply_tree_state(self, desired_files, desired_dirs, indexed_paths, error) -> None:
+        self._tree_refresh_running = False
+        if self._closing:
+            return
+        if error is not None:
+            self._write_reset_debug("TREE REFRESH FAILED", repr(error))
+        elif desired_files is not None and desired_dirs is not None:
+            self._indexed_source_paths = set(indexed_paths or ())
+            # Count files whose tree status requires an index update. This includes
+            # both unindexed files and previously indexed files marked changed.
+            # Externally selected "Pending" files are not included.
+            self._index_needed_paths = {
+                self._status_path_key(path)
+                for path, row in desired_files.items()
+                if len(row) >= 4 and row[3] in ("Not indexed", "Changed — index needed")
+            }
+            self._set_index_needed_status_count(len(self._index_needed_paths))
+            self._reconcile_tree(desired_files, desired_dirs)
 
+        if self._tree_refresh_pending:
+            self._tree_refresh_pending = False
+            wx.CallAfter(self._populate_tree)
 
-    def _reconcile_tree(self, desired_files: dict[str, tuple[str, str, str, str]]) -> None:
-        """Update the tree to match desired_files, preserving checkbox state."""
+    def _reconcile_tree(
+        self,
+        desired_files: dict[str, tuple[str, str, str, str]],
+        desired_dirs: dict[str, str],
+    ) -> None:
+        """Apply only tree differences; preserve existing items and checkbox state."""
         internal_root = self.tree.GetRootItem()
+        folder = Path(SEARCH_FOLDER).absolute()
 
-        existing_items: dict[str, dv.TreeListItem] = {}
+        desired_file_paths = {str(Path(p).absolute()) for p in desired_files}
+        desired_dir_sizes = {str(Path(p).absolute()): size for p, size in desired_dirs.items()}
+        desired_paths = set(desired_file_paths) | set(desired_dir_sizes)
 
-        def collect_existing(node: dv.TreeListItem) -> None:
-            path = self._get_item_path(node)
-            if path is not None:
-                existing_items[str(path.absolute())] = node
+        # On the initial pass the visible tree may contain only the loading label.
+        if not self._tree_items_by_path:
+            self.tree.DeleteAllItems()
 
-            child = self.tree.GetFirstChild(node)
-            while child.IsOk():
-                collect_existing(child)
-                child = self.tree.GetNextSibling(child)
-
-        child = self.tree.GetFirstChild(internal_root)
-        while child.IsOk():
-            collect_existing(child)
-            child = self.tree.GetNextSibling(child)
-
-        desired_paths = set(desired_files)
-        existing_paths = set(existing_items)
-
-        to_remove = existing_paths - desired_paths
-        for path_str in to_remove:
-            item = existing_items.get(path_str)
+        # Remove deepest paths first, so child tree items are deleted before parents.
+        for path_str in sorted(
+            set(self._tree_items_by_path) - desired_paths,
+            key=lambda value: len(Path(value).parts),
+            reverse=True,
+        ):
+            item = self._tree_items_by_path.pop(path_str, None)
             if item is not None and item.IsOk():
                 self.tree.DeleteItem(item)
 
-        if to_remove or (desired_paths - existing_paths):
-            checkbox_states: dict[str, bool] = {}
-            for path_str, item in existing_items.items():
-                if path_str in desired_paths:
-                    checkbox_states[path_str] = (
-                        self.tree.GetCheckedState(item) == wx.CHK_CHECKED
-                    )
+        # Add/update directories parent-first. Folder size is metadata only and is
+        # collected by the worker, not by the wx thread.
+        for path_str in sorted(
+            desired_dir_sizes,
+            key=lambda value: (len(Path(value).parts), value.casefold()),
+        ):
+            path = Path(path_str)
+            item = self._tree_items_by_path.get(path_str)
+            if item is None or not item.IsOk():
+                if path == folder:
+                    parent_item = internal_root
+                else:
+                    parent_item = self._tree_items_by_path.get(str(path.parent.absolute()))
+                    if parent_item is None or not parent_item.IsOk():
+                        continue
+                item = self.tree.AppendItem(parent_item, path.name or str(path), self._tree_folder_icon)
+                self._set_item_path(item, path)
+                self._tree_items_by_path[path_str] = item
+            self.tree.SetItemText(item, 1, desired_dir_sizes[path_str])
+            self.tree.SetItemText(item, 2, "")
+            self.tree.SetItemText(item, 3, "")
+            self.tree.SetItemText(item, 4, "")
 
-            self.tree.DeleteAllItems()
-            self._build_tree_from_desired(desired_files, Path(SEARCH_FOLDER).absolute())
+        # Add/update leaves. External pending files appear at the hidden root;
+        # files inside txt are parented to their corresponding directory item.
+        for path_str in sorted(desired_files, key=str.casefold):
+            path = Path(path_str).absolute()
+            name, size_str, word_count_str, status_text = desired_files[path_str]
+            item = self._tree_items_by_path.get(path_str)
+            if item is None or not item.IsOk():
+                if self._inside(path, folder):
+                    parent_item = self._tree_items_by_path.get(str(path.parent.absolute()))
+                    if parent_item is None or not parent_item.IsOk():
+                        continue
+                else:
+                    parent_item = internal_root
+                item = self.tree.AppendItem(parent_item, name, self._tree_file_icon)
+                self._set_item_path(item, path)
+                self._tree_items_by_path[path_str] = item
+            self.tree.SetItemText(item, 0, name)
+            self.tree.SetItemText(item, 1, size_str)
+            self.tree.SetItemText(item, 2, word_count_str)
+            self.tree.SetItemText(item, 3, status_text)
+            count = self._document_match_counts.get(path_str, 0)
+            self.tree.SetItemText(item, 4, str(count) if count > 0 else "")
 
-            def restore_checkboxes(node: dv.TreeListItem) -> None:
-                path = self._get_item_path(node)
-                if path is not None:
-                    path_str = str(path.absolute())
-                    if checkbox_states.get(path_str):
-                        self.tree.CheckItem(node, True)
-
-                child = self.tree.GetFirstChild(node)
-                while child.IsOk():
-                    restore_checkboxes(child)
-                    child = self.tree.GetNextSibling(child)
-
-            child = self.tree.GetFirstChild(internal_root)
-            while child.IsOk():
-                restore_checkboxes(child)
-                child = self.tree.GetNextSibling(child)
-        else:
-            for path_str, item in existing_items.items():
-                if path_str in desired_files:
-                    _, size_str, word_count_str, status_text = desired_files[path_str]
-                    self.tree.SetItemText(item, 1, size_str)
-                    self.tree.SetItemText(item, 2, word_count_str)
-                    self.tree.SetItemText(item, 3, status_text)
-
-        self._update_tree_results()
-
-
+        self._tree_file_paths = set(desired_file_paths)
+        root_item = self._tree_items_by_path.get(str(folder))
+        if root_item is not None and root_item.IsOk():
+            self.tree.Expand(root_item)
+        self.tree.Expand(internal_root)
 
     def _set_item_path(self, item: dv.TreeListItem, path: Path) -> None:
         """Attach the authoritative filesystem path to a tree item."""
@@ -1001,131 +1199,12 @@ class SearchFrame(wx.Frame):
 
 
 
-    def _build_tree_from_desired(
-        self,
-        desired_files: dict[str, tuple[str, str, str, str]],
-        folder: Path,
-    ) -> None:
-        """Build the tree structure from desired_files mapping."""
-        internal_root = self.tree.GetRootItem()
-
-        external_items: dict[str, tuple[str, str, str, str]] = {}
-        internal_items: dict[str, tuple[str, str, str, str]] = {}
-
-        for path_str, values in desired_files.items():
-            path = Path(path_str)
-            if not self._inside(path, folder):
-                external_items[path_str] = values
-            else:
-                internal_items[path_str] = values
-
-        # External files are root-level leaves.
-        for path_str in sorted(external_items):
-            name, size_str, wc_str, status = external_items[path_str]
-            item = self.tree.AppendItem(internal_root, name)
-            self.tree.SetItemText(item, 1, size_str)
-            self.tree.SetItemText(item, 2, wc_str)
-            self.tree.SetItemText(item, 3, status)
-            self.tree.SetItemText(item, 4, "")
-            self._set_item_path(item, Path(path_str))
-
-        if not internal_items:
-            return
-
-        folders: dict[str, list[tuple[str, str, str, str]]] = {}
-        for path_str, values in internal_items.items():
-            path = Path(path_str)
-            parent_dir = str(path.parent)
-            folders.setdefault(parent_dir, []).append(
-                (path.name, values[1], values[2], values[3])
-            )
-
-        def build_folder(dir_path: str, parent_item: dv.TreeListItem) -> dv.TreeListItem | None:
-            dir_obj = Path(dir_path)
-            dir_name = dir_obj.name or str(dir_obj)
-
-            item = self.tree.AppendItem(parent_item, dir_name)
-            self.tree.SetItemText(item, 1, self._format_size(int(dir_obj.stat().st_size)))
-            self.tree.SetItemText(item, 2, "")
-            self.tree.SetItemText(item, 3, "")
-            self.tree.SetItemText(item, 4, "")
-            self._set_item_path(item, dir_obj)
-
-            for name, fsize, fwc, fstatus in folders.get(dir_path, []):
-                file_path = dir_obj / name
-                file_item = self.tree.AppendItem(item, name)
-                self.tree.SetItemText(file_item, 1, fsize)
-                self.tree.SetItemText(file_item, 2, fwc)
-                self.tree.SetItemText(file_item, 3, fstatus)
-                self.tree.SetItemText(file_item, 4, "")
-                self._set_item_path(file_item, file_path)
-
-            if dir_obj.is_dir():
-                try:
-                    sub_dirs = sorted(
-                        (p for p in dir_obj.iterdir() if p.is_dir()),
-                        key=lambda p: p.name.casefold(),
-                    )
-                except OSError:
-                    sub_dirs = []
-
-                for sub_dir in sub_dirs:
-                    if sub_dir.name == "deleted":
-                        continue
-                    build_folder(str(sub_dir), item)
-
-            return item
-
-        main_folder_item = build_folder(str(folder), internal_root)
-        if main_folder_item is not None and main_folder_item.IsOk():
-            self.tree.Expand(main_folder_item)
-        self.tree.Expand(internal_root)
-
-
-
     def _refresh_tree(self) -> None:
         wx.CallAfter(self._populate_tree)
 
-
-    def _update_tree_results(self) -> None:
-        """Update only the Results column for file items."""
-        if self.tree is None:
-            return
-
-        internal_root = self.tree.GetRootItem()
-
-        def update_item(item: dv.TreeListItem) -> None:
-            path = self._get_item_path(item)
-            if path is None:
-                return
-
-            if not path.is_file() or path.suffix.casefold() != ".txt":
-                return
-
-            doc_path_str = str(path.absolute())
-            match_count = self._document_match_counts.get(doc_path_str, 0)
-            results_str = str(match_count) if match_count > 0 else ""
-            self.tree.SetItemText(item, 4, results_str)
-
-        def walk(node: dv.TreeListItem) -> None:
-            update_item(node)
-
-            child = self.tree.GetFirstChild(node)
-            while child.IsOk():
-                walk(child)
-                child = self.tree.GetNextSibling(child)
-
-        child = self.tree.GetFirstChild(internal_root)
-        while child.IsOk():
-            walk(child)
-            child = self.tree.GetNextSibling(child)
-
-
-
     def _bind_tree_click_handlers(self) -> None:
-        """Bind mouse events to handle row clicks for checkbox toggling."""
+        """Bind row-click checkbox toggling and the tree context menu."""
         self.tree.Bind(wx.EVT_LEFT_DOWN, self._on_tree_left_down)
-
         context_menu_event = getattr(dv, "EVT_TREELIST_ITEM_CONTEXT_MENU", None)
         if context_menu_event is not None:
             self.tree.Bind(context_menu_event, self._on_tree_item_context_menu)
@@ -1134,157 +1213,316 @@ class SearchFrame(wx.Frame):
             self._tree_context_event_bound = False
             self.tree.Bind(wx.EVT_RIGHT_DOWN, self._on_tree_right_down)
 
+    def _is_tree_file_item(self, item: dv.TreeListItem | None) -> bool:
+        """Return True for a file row; folder identity comes from its path."""
+        path = self._get_item_path(item)
+        if path is None:
+            return False
+        path_key = str(path.absolute())
+        if path_key in self._tree_file_paths:
+            return True
+        # The path may have just appeared before the tree cache is reconciled.
+        return path.suffix.casefold() == ".txt" and not path.is_dir()
 
     def _is_tree_toggleable_row(self, item: dv.TreeListItem | None) -> bool:
-        """Return True for rows whose checkbox may be toggled by row clicks."""
         if item is None or not item.IsOk():
             return False
-
-        if self._is_tree_file_item(item):
-            return True
-
         path = self._get_item_path(item)
-        return path is not None and path.is_dir()
-
-   
+        if path is None:
+            return False
+        return path.is_dir() or self._is_tree_file_item(item)
 
     def _on_tree_left_down(self, event: wx.MouseEvent) -> None:
-        """Handle left mouse button down on tree items."""
+        """Toggle a row on click anywhere except the native expand/collapse button."""
         item = self._get_tree_item_from_event(event)
-
-        if item is None or not item.IsOk():
+        if item is None or not self._is_tree_toggleable_row(item):
             event.Skip()
             return
 
-        if not self._is_tree_toggleable_row(item):
-            event.Skip()
-            return
-
-        # Determine if the click was on the checkbox itself.
-        source = event.GetEventObject()
-        clicked_on_checkbox = False
-
-        if isinstance(source, wx.Window):
-            try:
-                screen_pos = source.ClientToScreen(event.GetPosition())
-                main_window = self.tree
-                get_main = getattr(self.tree, "GetMainWindow", None)
-                if callable(get_main):
-                    try:
-                        candidate = get_main()
-                        if candidate is not None:
-                            main_window = candidate
-                    except Exception:
-                        pass
-
-                pos = main_window.ScreenToClient(screen_pos)
-
-                # If the click is inside the first column, treat it as a checkbox click.
-                col_width = self.tree.GetColumnWidth(0)
-                clicked_on_checkbox = pos.x < col_width
-
-            except Exception:
-                clicked_on_checkbox = False
-
-        if clicked_on_checkbox:
-            # Let wx handle checkbox clicks natively.
-            event.Skip()
-            return
-
-        # Click was on the row area, not the checkbox.
+        # Preserve native folder expansion when the click is on the disclosure
+        # button. TreeListCtrl versions differ in whether HitTest returns flags.
         try:
-            current_state = int(self.tree.GetCheckedState(item))
+            source = event.GetEventObject()
+            screen_pos = source.ClientToScreen(event.GetPosition())
+            main_window = self.tree
+            get_main_window = getattr(self.tree, "GetMainWindow", None)
+            if callable(get_main_window):
+                candidate = get_main_window()
+                if candidate is not None:
+                    main_window = candidate
+            client_pos = main_window.ScreenToClient(screen_pos)
+            hit = self.tree.HitTest(client_pos)
+            if isinstance(hit, tuple) and len(hit) > 1:
+                flags = hit[1]
+                button_flag = getattr(wx, "TREE_HITTEST_ONITEMBUTTON", None)
+                if button_flag is not None and flags & button_flag:
+                    event.Skip()
+                    return
         except Exception:
-            event.Skip()
-            return
-
-        new_state = wx.CHK_UNCHECKED if current_state == wx.CHK_CHECKED else wx.CHK_CHECKED
-        self._apply_tree_check_state(item, new_state)
-
-        # Do not skip the event so wx can still select the row normally.
-
-
-
-
-    def _is_tree_file_item(self, item: dv.TreeListItem | None) -> bool:
-        """Return True for a leaf row representing a .txt file."""
-        if item is None or not item.IsOk():
-            return False
-        name = self.tree.GetItemText(item, 0)
-        if not name.casefold().endswith(".txt"):
-            return False
-        child = self.tree.GetFirstChild(item)
-        return not child.IsOk()
-
-
-    def _on_tree_item_activated(self, event: dv.TreeListEvent) -> None:
-        """Handle row activation clicks on toggleable rows."""
-        item = event.GetItem()
-        if not item.IsOk():
-            event.Skip()
-            return
-
-        if not self._is_tree_toggleable_row(item):
-            event.Skip()
-            return
+            # The checkbox action below still works if platform hit flags aren't
+            # exposed by this wx port.
+            pass
 
         try:
             current_state = int(self.tree.GetCheckedState(item))
         except Exception:
             event.Skip()
             return
-
         new_state = (
             wx.CHK_UNCHECKED
             if current_state == wx.CHK_CHECKED
             else wx.CHK_CHECKED
         )
         self._apply_tree_check_state(item, new_state)
+        # Consume this click to prevent wx from toggling the checkbox a second time.
+
+    def _on_tree_item_activated(self, event: dv.TreeListEvent) -> None:
+        """Let native activation proceed; row clicks already toggle check state."""
         event.Skip()
 
-
-
-    def _apply_tree_check_state(
-        self,
-        item: dv.TreeListItem,
-        state: int,
-    ) -> None:
-        """Apply a checkbox state to a file or folder row."""
-        if not item.IsOk():
+    def _apply_tree_check_state(self, item: dv.TreeListItem, state: int) -> None:
+        """Set a row's checked state and cascade it through folder descendants."""
+        if item is None or not item.IsOk():
             return
-
-        if self._is_tree_file_item(item):
-            self.tree.CheckItem(item, state)
+        if self._tree_check_propagating:
             return
-
-        # Folder rows propagate to children and subfolders.
-        self.tree.CheckItemRecursively(item, state)
-
-
+        self._tree_check_propagating = True
+        try:
+            path = self._get_item_path(item)
+            if path is not None and path.is_dir():
+                # This updates every nested folder and every file below it.
+                self.tree.CheckItemRecursively(item, state)
+            else:
+                self.tree.CheckItem(item, state)
+        finally:
+            self._tree_check_propagating = False
 
     def _on_tree_checked(self, event: dv.TreeListEvent) -> None:
-        """Handle native checkbox toggles."""
+        """Propagate native checkbox changes on folders to every descendant."""
         item = event.GetItem()
         if not item.IsOk():
             event.Skip()
             return
-
-        if self._is_tree_file_item(item):
+        if self._tree_check_propagating:
             event.Skip()
             return
-
-        # For folders, propagate the new state to children and subfolders.
-        try:
-            current_state = int(self.tree.GetCheckedState(item))
-        except Exception:
-            event.Skip()
-            return
-
-        self._apply_tree_check_state(item, current_state)
+        path = self._get_item_path(item)
+        if path is not None and path.is_dir():
+            try:
+                state = int(self.tree.GetCheckedState(item))
+                self._apply_tree_check_state(item, state)
+            except Exception as exc:
+                self._write_reset_debug("FOLDER CHECK PROPAGATION FAILED", repr(exc))
         event.Skip()
 
+    def _on_tree_refresh_timer(self, _event: wx.TimerEvent) -> None:
+        self._refresh_tree()
 
+    def _start_filesystem_monitor(self) -> None:
+        """Start a recursive Watchdog observer for txt; events never touch the DB."""
+        if self._watchdog_observer is not None or self._closing:
+            return
+        if Observer is None:
+            self.SetStatusText(
+                "Database loaded; live folder monitoring unavailable. Install watchdog with: python -m pip install watchdog"
+            )
+            return
+        folder = Path(SEARCH_FOLDER).absolute()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            observer = Observer()
+            handler = _SearchFolderEventHandler(self._queue_watchdog_event)
+            observer.schedule(handler, str(folder), recursive=True)
+            observer.start()
+            self._watchdog_observer = observer
+        except Exception as exc:
+            self._watchdog_observer = None
+            self.SetStatusText(f"Filesystem monitoring failed: {exc}")
+            self._write_reset_debug("WATCHDOG START FAILED", repr(exc))
 
+    def _queue_watchdog_event(
+        self, event_type: str, src_path: str, dest_path: str, is_directory: bool
+    ) -> None:
+        """Coalesce filesystem notifications; never touch the database here."""
+        if self._closing:
+            return
+        folder = Path(SEARCH_FOLDER).absolute()
+        src = Path(src_path).absolute() if src_path else None
+        dest = Path(dest_path).absolute() if dest_path else None
+
+        def inside_root(path: Path | None) -> bool:
+            return path is not None and self._inside(path, folder)
+
+        source_in = inside_root(src)
+        dest_in = inside_root(dest)
+        if is_directory:
+            relevant = event_type in {"created", "moved", "deleted"} and (source_in or dest_in)
+        else:
+            relevant = (
+                (source_in and src is not None and src.suffix.casefold() == ".txt")
+                or (dest_in and dest is not None and dest.suffix.casefold() == ".txt")
+            )
+        if not relevant:
+            return
+
+        # One observer thread delivers filesystem events. The generation counter
+        # lets manual indexing detect a concurrent event without doing DB work here.
+        self._watch_generation += 1
+        should_dispatch = False
+        with self._watchdog_event_lock:
+            if is_directory:
+                # Directory operations can affect many descendant items. Reconcile
+                # once after the burst has settled, rather than once per child file.
+                self._watchdog_force_tree_scan = True
+                if event_type in {"deleted", "moved"} and source_in and src is not None:
+                    self._watchdog_dirty_prefix_removals.add(str(src))
+            else:
+                if source_in and src is not None and src.suffix.casefold() == ".txt":
+                    self._watchdog_changed_files.add(str(src))
+                    if event_type in {"deleted", "moved"}:
+                        self._watchdog_dirty_removals.add(str(src))
+                if dest_in and dest is not None and dest.suffix.casefold() == ".txt":
+                    self._watchdog_changed_files.add(str(dest))
+                candidate = dest if event_type == "moved" else src
+                candidate_in = dest_in if event_type == "moved" else source_in
+                if (
+                    event_type in {"created", "modified", "moved"}
+                    and candidate_in
+                    and candidate is not None
+                    and candidate.suffix.casefold() == ".txt"
+                    and str(candidate) in self._indexed_source_paths
+                ):
+                    self._watchdog_dirty_additions.add(str(candidate))
+
+            if not self._watchdog_dispatch_scheduled:
+                self._watchdog_dispatch_scheduled = True
+                should_dispatch = True
+
+        if should_dispatch:
+            wx.CallAfter(self._drain_watchdog_events)
+
+    def _drain_watchdog_events(self) -> None:
+        """Apply accumulated events in one UI-thread batch."""
+        with self._watchdog_event_lock:
+            changed_files = set(self._watchdog_changed_files)
+            dirty_additions = set(self._watchdog_dirty_additions)
+            dirty_removals = set(self._watchdog_dirty_removals)
+            prefix_removals = set(self._watchdog_dirty_prefix_removals)
+            force_tree_scan = self._watchdog_force_tree_scan
+            self._watchdog_changed_files.clear()
+            self._watchdog_dirty_additions.clear()
+            self._watchdog_dirty_removals.clear()
+            self._watchdog_dirty_prefix_removals.clear()
+            self._watchdog_force_tree_scan = False
+            self._watchdog_dispatch_scheduled = False
+
+        if self._closing:
+            return
+        self._monitor_dirty_paths.difference_update(dirty_removals)
+        for prefix in prefix_removals:
+            self._monitor_dirty_paths = {
+                path for path in self._monitor_dirty_paths
+                if path != prefix and not path.startswith(prefix + os.sep)
+            }
+        self._monitor_dirty_paths.update(dirty_additions)
+
+        if force_tree_scan:
+            # A directory operation may add/remove many descendants; debounce it.
+            self._tree_refresh_timer.StartOnce(350)
+        elif changed_files:
+            # Normal create/modify/move/delete events only touch their affected
+            # rows. If a parent directory is not represented yet, fall back to a
+            # single debounced reconciliation so the tree can be repaired safely.
+            if not self._apply_watchdog_file_changes(changed_files):
+                self._tree_refresh_timer.StartOnce(350)
+
+    def _apply_watchdog_file_changes(self, changed_files: set[str]) -> bool:
+        """Update individual file rows without rescanning 50,000 sibling files.
+
+        Returns False when the parent tree item is missing, signaling a full
+        background reconciliation (usually for a just-created/moved directory).
+        """
+        folder = Path(SEARCH_FOLDER).absolute()
+        for raw_path in sorted(changed_files, key=str.casefold):
+            path = Path(raw_path).absolute()
+            if not self._inside(path, folder) or path.suffix.casefold() != ".txt":
+                continue
+            path_key = str(path)
+            if not path.is_file():
+                item = self._tree_items_by_path.pop(path_key, None)
+                if item is not None and item.IsOk():
+                    self.tree.DeleteItem(item)
+                self._tree_file_paths.discard(path_key)
+                self._monitor_dirty_paths.discard(path_key)
+                self._index_needed_paths.discard(self._status_path_key(path))
+                self._set_index_needed_status_count(len(self._index_needed_paths))
+                continue
+
+            try:
+                stat_result = path.stat()
+            except OSError:
+                # The file may have been removed between the event and this update.
+                continue
+
+            parent_key = str(path.parent.absolute())
+            parent_item = self._tree_items_by_path.get(parent_key)
+            if parent_item is None or not parent_item.IsOk():
+                return False
+
+            item = self._tree_items_by_path.get(path_key)
+            if item is not None and not item.IsOk():
+                item = None
+                self._tree_items_by_path.pop(path_key, None)
+            if item is None:
+                item = self.tree.AppendItem(parent_item, path.name, self._tree_file_icon)
+                self._set_item_path(item, path)
+                self._tree_items_by_path[path_key] = item
+
+            is_indexed = path_key in self._indexed_source_paths
+            if is_indexed:
+                status_text = (
+                    "Changed — index needed"
+                    if path_key in self._monitor_dirty_paths
+                    else "Indexed"
+                )
+            else:
+                status_text = "Pending" if path in self.pending_paths else "Not indexed"
+
+            status_key = self._status_path_key(path)
+            if status_text in ("Not indexed", "Changed — index needed"):
+                self._index_needed_paths.add(status_key)
+            else:
+                self._index_needed_paths.discard(status_key)
+            self._set_index_needed_status_count(len(self._index_needed_paths))
+
+            size_text = self._format_size(int(stat_result.st_size))
+            # Retain the last indexed word count for known documents. New files
+            # have not been indexed, so the word count remains unavailable.
+            if is_indexed:
+                word_count_text = self.tree.GetItemText(item, 2) or "—"
+            else:
+                word_count_text = "—"
+            self.tree.SetItemText(item, 0, path.name)
+            self.tree.SetItemText(item, 1, size_text)
+            self.tree.SetItemText(item, 2, word_count_text)
+            self.tree.SetItemText(item, 3, status_text)
+            match_count = self._document_match_counts.get(path_key, 0)
+            self.tree.SetItemText(item, 4, str(match_count) if match_count > 0 else "")
+            self._tree_file_paths.add(path_key)
+        return True
+
+    def _update_tree_results(self) -> None:
+        """Update the Results column using cached file items; avoid a full tree walk."""
+        if self.tree is None:
+            return
+        for path_str in self._tree_file_paths:
+            if Path(path_str).suffix.casefold() != ".txt":
+                continue
+            item = self._tree_items_by_path.get(path_str)
+            if item is None or not item.IsOk():
+                continue
+            match_count = self._document_match_counts.get(path_str, 0)
+            self.tree.SetItemText(item, 4, str(match_count) if match_count > 0 else "")
 
 
     def _get_selected_leaf_paths(self) -> set[Path]:
@@ -1315,74 +1553,21 @@ class SearchFrame(wx.Frame):
         return selected
 
 
-    def _folder_state(self) -> dict[str, tuple[int, int]]:
-        """Return the current filesystem state of searchable .txt files."""
-        folder = Path(SEARCH_FOLDER).absolute()
-        state: dict[str, tuple[int, int]] = {}
-        try:
-            paths = list(folder.rglob("*.txt"))
-        except OSError:
-            return state
-        for path in paths:
-            if self._is_deleted_path(path, folder):
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            state[str(path.absolute())] = (int(stat.st_mtime_ns), int(stat.st_size))
-        return state
-
-    def _indexed_folder_state(self) -> dict[str, tuple[int, int]]:
-        """Return filesystem state for files that are actually in the database.
-
-        This is deliberately different from ``_folder_state()``.  A file that
-        exists on disk but is not indexed must NOT appear in the indexed
-        snapshot; otherwise the Index New Files button can incorrectly decide
-        that there is nothing to do.  Missing indexed files are retained with a
-        sentinel state so their removal is also detected.
-        """
-        state: dict[str, tuple[int, int]] = {}
-        if self.engine is None:
-            return state
-
-        folder = Path(SEARCH_FOLDER).absolute()
-        for row in self.engine.list_documents():
-            try:
-                path = Path(str(row["path"])).absolute()
-                # Use self._instead of module-level path_in_folder
-                if not self._inside(path, folder) or self._is_deleted_path(path, folder):
-                    continue
-                try:
-                    stat = path.stat()
-                except OSError:
-                    # Keep the indexed path in the snapshot so the missing file
-                    # is seen as a removal on the next manual synchronization.
-                    state[str(path)] = (-1, -1)
-                    continue
-                state[str(path)] = (int(stat.st_mtime_ns), int(stat.st_size))
-            except (KeyError, TypeError, ValueError):
-                continue
-        return state
-
-    def _on_folder_timer(self, _event: wx.TimerEvent) -> None:
-        if self.engine is None or self.busy:
-            return
-
-        current = self._folder_state()
-        # The timer only tracks what is currently visible on disk.  Do NOT copy
-        # this into _folder_snapshot: that snapshot represents the last state
-        # actually synchronized with the database.  Otherwise a newly created
-        # file gets noticed by the timer, the snapshot advances, and the manual
-        # "Index new files" button incorrectly concludes that nothing changed.
-        if current == self._folder_view_snapshot:
-            return
-
-        self._folder_view_snapshot = current
-        self._refresh_tree()
-
     def _on_close(self, _event: wx.CloseEvent) -> None:
         self._write_reset_debug("GUI CLOSING")
+        self._closing = True
+        observer = self._watchdog_observer
+        self._watchdog_observer = None
+        if observer is not None:
+            try:
+                observer.stop()
+                threading.Thread(
+                    target=observer.join,
+                    name="watchdog-shutdown",
+                    daemon=True,
+                ).start()
+            except Exception:
+                pass
         try:
             faulthandler.disable()
         except Exception:
@@ -1393,10 +1578,12 @@ class SearchFrame(wx.Frame):
                 self._faulthandler_stream.close()
             except Exception:
                 pass
-        if self._folder_timer.IsRunning():
-            self._folder_timer.Stop()
+        if self._tree_refresh_timer.IsRunning():
+            self._tree_refresh_timer.Stop()
         if self._search_progress_timer.IsRunning():
             self._search_progress_timer.Stop()
+        if self._index_needed_status_timer.IsRunning():
+            self._index_needed_status_timer.Stop()
         if self._document_browser is not None:
             try:
                 self._document_browser.Destroy()
@@ -1552,7 +1739,7 @@ class SearchFrame(wx.Frame):
             return
 
         file_name = path.name
-        deleted_folder = Path(SEARCH_FOLDER).absolute() / "deleted"
+        deleted_folder = Path(SEARCH_FOLDER).absolute().parent / "deleted"
 
         confirmation = wx.MessageBox(
             f"Remove '{file_name}' from the database and move the original file to:\n\n"
@@ -1618,11 +1805,10 @@ class SearchFrame(wx.Frame):
                 return
 
             self._document_match_counts.pop(str(path.absolute()), None)
+            self._monitor_dirty_paths.discard(str(path.absolute()))
             self._reset_stats()
 
             self._refresh_tree()
-            self._folder_snapshot = self._folder_state()
-            self._folder_view_snapshot = dict(self._folder_snapshot)
 
             # Keep 100% visible for one second after deletion/reindexing.
             self._update_index_progress(1.0, "Ready")
@@ -1641,20 +1827,16 @@ class SearchFrame(wx.Frame):
         search_folder = Path(SEARCH_FOLDER).absolute()
         folder_path = folder_path.absolute()
 
-        # The search-folder root and the hidden deleted tree are never removable.
-        if (
-            folder_path == search_folder
-            or not self._inside(folder_path, search_folder)
-            or self._is_deleted_path(folder_path, search_folder)
-        ):
+        # Only the search-folder root itself is protected from folder removal.
+        if folder_path == search_folder or not self._inside(folder_path, search_folder):
             return
 
         try:
             text_files = sorted(
                 (
                     p.absolute()
-                    for p in folder_path.rglob("*.txt")
-                    if p.is_file() and not self._is_deleted_path(p, search_folder)
+                    for p in folder_path.rglob("*")
+                    if p.is_file() and p.suffix.casefold() == ".txt"
                 ),
                 key=lambda p: str(p).casefold(),
             )
@@ -1669,7 +1851,7 @@ class SearchFrame(wx.Frame):
         confirmation = wx.MessageBox(
             f"Remove the complete folder tree from the database and move all .txt files "
             f"below it to:\n\n"
-            f"{search_folder / 'deleted' / folder_path.name}\n\n"
+            f"{search_folder.parent / 'deleted' / folder_path.name}\n\n"
             f"Folder: {folder_path}\n"
             f"Text files found: {len(text_files)}",
             "Delete folder tree",
@@ -1720,8 +1902,8 @@ class SearchFrame(wx.Frame):
             # during ordinary document removal/indexing operations.
 
             # Move only .txt files; preserve their folder structure below the
-            # selected folder under SEARCH_FOLDER/deleted/<selected-folder>/...
-            deleted_root = search_folder / "deleted"
+            # selected folder under the sibling deleted/<selected-folder>/...
+            deleted_root = search_folder.parent / "deleted"
             destination_root = deleted_root / folder_path.name
             if destination_root.exists():
                 serial = 1
@@ -1792,11 +1974,13 @@ class SearchFrame(wx.Frame):
                 for p, count in self._document_match_counts.items()
                 if not self._inside(Path(p).absolute(), folder_path)
             }
+            self._monitor_dirty_paths = {
+                p for p in self._monitor_dirty_paths
+                if not self._inside(Path(p).absolute(), folder_path)
+            }
             self._reset_stats()
 
             self._refresh_tree()
-            self._folder_snapshot = self._folder_state()
-            self._folder_view_snapshot = dict(self._folder_snapshot)
 
             self._update_index_progress(1.0, "Ready")
             self._schedule_index_progress_reset(delay_ms=1000)
@@ -2034,9 +2218,6 @@ class SearchFrame(wx.Frame):
                 wx.MessageBox(str(error), "Copy error", wx.OK | wx.ICON_ERROR)
                 return
             self.pending_paths.update(result or [])
-            # These copied files are not indexed yet. Keep _folder_snapshot at
-            # the last synchronized state so "Index new files" will detect them.
-            self._folder_view_snapshot = self._folder_state()
             self._refresh_tree()
             copied_count = len(result or [])
             self.SetStatusText(
@@ -2066,11 +2247,11 @@ class SearchFrame(wx.Frame):
         def copy_files() -> list[Path]:
             folder.mkdir(parents=True, exist_ok=True)
             copied: list[Path] = []
-            for source in sorted(chosen_dir.rglob("*.txt"), key=lambda p: str(p).casefold()):
-                if not source.is_file():
-                    continue
-                if "deleted" in source.relative_to(chosen_dir).parts:
-                    continue
+            for source in sorted(
+                (p for p in chosen_dir.rglob("*")
+                 if p.is_file() and p.suffix.casefold() == ".txt"),
+                key=lambda p: str(p).casefold(),
+            ):
                 # Preserve sub-folder structure relative to the chosen directory.
                 rel = source.relative_to(chosen_dir)
                 destination = folder / rel
@@ -2096,12 +2277,8 @@ class SearchFrame(wx.Frame):
                 self.SetStatusText("Copy failed.")
                 wx.MessageBox(str(error), "Copy error", wx.OK | wx.ICON_ERROR)
                 return
-            # Files inside SEARCH_FOLDER are already tracked via the folder scanner;
-            # add them to pending_paths so they appear in the tree as well.
+            # Add copied paths so they appear in the tree before indexing.
             self.pending_paths.update(result or [])
-            # These copied files are not indexed yet. Keep _folder_snapshot at
-            # the last synchronized state so "Index new files" will detect them.
-            self._folder_view_snapshot = self._folder_state()
             self._refresh_tree()
             copied_count = len(result or [])
             self.SetStatusText(
@@ -2216,8 +2393,6 @@ class SearchFrame(wx.Frame):
                 wx.MessageBox(str(error), "Reset database error", wx.OK | wx.ICON_ERROR)
                 return
             self._refresh_tree()
-            self._folder_snapshot = {}
-            self._folder_view_snapshot = self._folder_state()
 
 
             self._update_index_progress(1.0, "Ready")
@@ -2240,12 +2415,10 @@ class SearchFrame(wx.Frame):
     def _on_index_new(self, _event: wx.CommandEvent) -> None:
         folder = Path(SEARCH_FOLDER).absolute()
 
-        # A manual index operation is only needed when the folder contents/metadata
-        # changed or there are explicitly pending external files to add.
-        current_snapshot = self._folder_state()
-        if current_snapshot == self._folder_snapshot and not self.pending_paths:
-            self.SetStatusText("No new files for indexing.")
-            return
+        # Explicit indexing owns all database updates. The engine compares its last
+        # successful metadata snapshot, hashing only new/changed files; monitoring
+        # notifications never index or synchronize database content.
+        watch_generation_at_start = self._watch_generation
 
         # Stop any existing reset timer. The timer is optional, so never
         # call IsRunning() on None.
@@ -2298,27 +2471,32 @@ class SearchFrame(wx.Frame):
                 return
 
             self.pending_paths.clear()
+            if self._watch_generation == watch_generation_at_start:
+                self._monitor_dirty_paths.clear()
             self._refresh_tree()
             sync_result, manual_result = result
             added = sync_result["added"] + manual_result["added"]
             changed = sync_result["changed"] + manual_result["changed"]
             removed = sync_result["removed"] + manual_result["removed"]
+            renamed = int(sync_result.get("renamed", 0)) + int(manual_result.get("renamed", 0))
+            locations_added = int(sync_result.get("locations_added", 0)) + int(
+                manual_result.get("locations_added", 0)
+            )
+            locations_removed = int(sync_result.get("locations_removed", 0)) + int(
+                manual_result.get("locations_removed", 0)
+            )
 
-            if added == 0 and changed == 0 and removed == 0:
+            if added == 0 and changed == 0 and removed == 0 and renamed == 0 and locations_added == 0 and locations_removed == 0:
                 self._update_index_progress(1.0, "Ready")
                 self._schedule_index_progress_reset(delay_ms=1000)
-                self._folder_snapshot = self._folder_state()
-                self._folder_view_snapshot = dict(self._folder_snapshot)
-                self.SetStatusText("No new files for indexing.")
+                self.SetStatusText("No new or changed files to index.")
                 return
 
             self._update_index_progress(1.0, "Ready")
             self._schedule_index_progress_reset(delay_ms=1000)
-
-            self._folder_snapshot = self._folder_state()
-            self._folder_view_snapshot = dict(self._folder_snapshot)
             self.SetStatusText(
-                f"Index updated: {added} added, {changed} changed, {removed} removed."
+                f"Index updated: {added} added, {changed} changed, {removed} removed, "
+                f"{renamed} renamed/moved."
             )
 
         self._run_background(work, done)
@@ -2348,7 +2526,8 @@ class SearchFrame(wx.Frame):
 
         from document_browser import DocumentBrowserFrame
 
-        self._document_browser = DocumentBrowserFrame(self, self._last_search_hits)
+        snippet_ctx = self._read_non_negative_int(self.snippet_context_chars, "SNIPPET_CONTEXT_CHARS")
+        self._document_browser = DocumentBrowserFrame(self, self._last_search_hits, snippet_context_chars=snippet_ctx)
         self._document_browser.Show(True)
         self._document_browser.Raise()
         self._document_browser.SetFocus()
@@ -2606,11 +2785,9 @@ class SearchFrame(wx.Frame):
 
     @staticmethod
     def _is_deleted_path(path: Path, folder: Path) -> bool:
-        try:
-            rel = path.relative_to(folder)
-        except ValueError:
-            return "deleted" in path.parts
-        return "deleted" in rel.parts
+        r"""True only for paths stored in the sibling archive, not txt\deleted."""
+        deleted_root = Path(folder).absolute().parent / "deleted"
+        return SearchFrame._inside(Path(path).absolute(), deleted_root)
 
 
 
