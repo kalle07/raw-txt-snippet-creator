@@ -1,3 +1,4 @@
+
 """Persistent positional text index and search engine.
 
 Dependencies:
@@ -27,6 +28,10 @@ TERMS
 POSTINGS
     One row per ``(doc_id, term_id)``. ``positions`` is a flat Arrow
     ``list<int32>`` containing ``[start1, length1, start2, length2, ...]``.
+    ``wrapper_flags`` is a parallel ``list<string>`` with one entry per
+    occurrence aligned to positions: ``""`` marks an unwrapped occurrence,
+    while values such as ``"()"``, ``"[]"``, ``"«»"`` record which wrapper
+    pair surrounded that occurrence.
 
 TERM_FREQUENCIES
     One row per ``(doc_id, term_id)`` with only the occurrence count.
@@ -47,13 +52,10 @@ Search funnel:
 
 from __future__ import annotations
 
-
-
 import concurrent.futures
 import hashlib
 import json
 import inspect
-import logging
 import os
 import re
 import unicodedata
@@ -69,60 +71,83 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal, Sequence
 
+from app_logging import get_app_logger
+
 import lancedb
 import numpy as np
 import pyarrow as pa
 from rapidfuzz import process
 from rapidfuzz.distance import Levenshtein
 
-# -----------------------------------------------------------------------------
-# Defaults
-# -----------------------------------------------------------------------------
+# Module map:
+# Configuration/constants -> schemas/models -> tokenization -> source scanning ->
+# LanceDB primitives -> index construction -> candidate retrieval -> query planning ->
+# positional matching -> snippets/documents -> maintenance -> synchronization ->
+# search facade -> report formatting.
+# Definitions stay module-level to preserve the GUI and integration import API.
+
+# =============================================================================
+# Configuration and compatibility constants
+# =============================================================================
 
 DB_PATH = "text_search.lancedb"
+
 SEARCH_FOLDER = "txt"
+
 FUZZY_DISTANCE = 1
-MAX_DISTANCE_CHARS = 200
+
+MAX_DISTANCE_CHARS = 500
+
 SNIPPET_CONTEXT_CHARS = 200
+
 MAX_RESULTS: int | None = 50
+
 MAX_RESULTS_PER_DOCUMENT: int | None = 20
 
-# Backward-compatible legacy name. New code should use MAX_RESULTS_PER_DOCUMENT.
 MAX_PROXIMITY_CHAINS_PER_DOCUMENT: int | None = None
 
 DOCS_TABLE = "docs"
+
 DOCUMENT_LOCATIONS_TABLE = "document_locations"
+
 TERMS_TABLE = "terms"
+
 POSTINGS_TABLE = "postings"
+
 TERM_FREQUENCIES_TABLE = "term_frequencies"
+
 FTS_DOCS_TABLE = "fts_docs"
+
 FTS_KEY_COLUMN = "fts_key"
 
 FTS_MAX_CHUNK_LENGTH = 100
-SEARCH_DEBUG_LOG = "search_debug.log"
 
-# LanceDB maintenance policy.
 LANCE_OPTIMIZE_AFTER_MODIFICATIONS = 20  # Used only for explicitly requested maintenance.
+
 LANCE_ZERO_AGE = timedelta(0)
+
 LANCE_CLEANUP_EVERY_STARTS = 20
+
 LANCE_CLEANUP_RETENTION = timedelta(days=7)
+
 LANCE_MAINTENANCE_STATE_FILE = ".lancedb_maintenance.json"
 
-logger = logging.getLogger(__name__)
-if not logger.handlers:
-    logger.setLevel(logging.INFO)
-    _file_handler = logging.FileHandler(SEARCH_DEBUG_LOG, encoding="utf-8")
-    _file_handler.setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-    )
-    logger.addHandler(_file_handler)
+SEARCH_DEBUG_LOG = "search_debug.log"
+
+logger = get_app_logger("engine")
 
 SearchMode = Literal["regex", "fuzzy"]
+
 TermSearchMode = Literal["regex", "fuzzy", "both"]
+
 TermType = Literal["normal", "additional"]
+
 TermKey = tuple[str, str]
+
 QueryRoute = Literal["normal", "additional", "fallback"]
+
 FALLBACK_TERM_ID = -1
+
 ProgressCallback = Callable[[str, float], None]
 
 
@@ -137,20 +162,262 @@ def _notify_progress(
     try:
         callback(stage, max(0.0, min(1.0, float(fraction))))
     except Exception:
-        pass
+        logger.warning("Progress callback failed at stage %r", stage, exc_info=True)
+
+# =============================================================================
+# Persistent schemas and result models
+# =============================================================================
+
+DOCS_SCHEMA = pa.schema(
+    [
+        pa.field("id", pa.int32()),
+        # Compatibility/display path only. The authoritative list of physical
+        # paths lives in DOCUMENT_LOCATIONS_TABLE.
+        pa.field("path", pa.string()),
+        pa.field("sha256", pa.string()),
+        pa.field("content", pa.string()),
+        pa.field("word_count", pa.int32()),
+    ]
+)
+
+DOCUMENT_LOCATIONS_SCHEMA = pa.schema(
+    [
+        pa.field("doc_id", pa.int32()),
+        pa.field("path", pa.string()),
+    ]
+)
+
+TERMS_SCHEMA = pa.schema(
+    [
+        pa.field("term_id", pa.int32()),
+        pa.field("term_type", pa.string()),
+        pa.field("term", pa.string()),
+        pa.field("token_length", pa.int32()),
+    ]
+)
+
+POSTINGS_SCHEMA = pa.schema(
+    [
+        pa.field("doc_id", pa.int32()),
+        pa.field("term_id", pa.int32()),
+        pa.field("positions", pa.list_(pa.int32())),
+        pa.field("wrapper_flags", pa.list_(pa.string())),
+    ]
+)
+
+TERM_FREQUENCIES_SCHEMA = pa.schema(
+    [
+        pa.field("doc_id", pa.int32()),
+        pa.field("term_id", pa.int32()),
+        pa.field("occurrence_count", pa.int32()),
+    ]
+)
+
+FTS_DOCS_SCHEMA = pa.schema(
+    [
+        pa.field("doc_id", pa.int32()),
+        pa.field("term_id", pa.int32()),
+        pa.field(FTS_KEY_COLUMN, pa.string()),
+    ]
+)
+
+INDEX_TABLE_SPECS = (
+    (DOCS_TABLE, DOCS_SCHEMA),
+    (DOCUMENT_LOCATIONS_TABLE, DOCUMENT_LOCATIONS_SCHEMA),
+    (TERMS_TABLE, TERMS_SCHEMA),
+    (POSTINGS_TABLE, POSTINGS_SCHEMA),
+    (TERM_FREQUENCIES_TABLE, TERM_FREQUENCIES_SCHEMA),
+    (FTS_DOCS_TABLE, FTS_DOCS_SCHEMA),
+)
 
 
-# Regex/wildcard semantics are intentionally kept compatible with the existing
-# engine. Matching is always against complete normalized indexed tokens.
-# old TOKEN_PATTERN = re.compile(r"[0-9A-Za-z_.\-ÄÖÜäöüß]+", re.UNICODE)
-# allow Unicode word chars plus underscore, dot, hyphen
+@dataclass(frozen=True, slots=True)
+class SearchConfig:
+    fuzzy_distance: int = FUZZY_DISTANCE
+    max_distance_chars: int = MAX_DISTANCE_CHARS
+    snippet_context_chars: int = SNIPPET_CONTEXT_CHARS
+    max_results_per_document: int | None = MAX_RESULTS_PER_DOCUMENT
+    # Kept for compatibility with callers that constructed SearchConfig directly.
+    # When supplied, this legacy value takes precedence over the new field.
+    max_proximity_chains_per_document: int | None = MAX_PROXIMITY_CHAINS_PER_DOCUMENT
+    case_sensitive: tuple[bool, ...] = ()
+    term_modes: tuple[TermSearchMode, ...] = ()
+
+    @property
+    def effective_max_results_per_document(self) -> int | None:
+        if self.max_proximity_chains_per_document is not None:
+            return self.max_proximity_chains_per_document
+        return self.max_results_per_document
+
+    def __post_init__(self) -> None:
+        if self.fuzzy_distance < 0:
+            raise ValueError("FUZZY_DISTANCE must be >= 0")
+        if self.max_distance_chars < 0:
+            raise ValueError("MAX_DISTANCE_CHARS must be >= 0")
+        if self.snippet_context_chars < 0:
+            raise ValueError("SNIPPET_CONTEXT_CHARS must be >= 0")
+
+        for name, value in (
+            ("MAX_RESULTS_PER_DOCUMENT", self.max_results_per_document),
+            (
+                "MAX_PROXIMITY_CHAINS_PER_DOCUMENT",
+                self.max_proximity_chains_per_document,
+            ),
+        ):
+            if value is not None and value < 1:
+                raise ValueError(f"{name} must be >= 1 or None")
+
+
+@dataclass(slots=True)
+class SearchHit:
+    doc_id: int
+    document: dict
+    matches_by_term: list[list[dict]]
+    chains: list[list[dict]]
+    mode: str
+    term_modes: list[TermSearchMode] = field(default_factory=list)
+
+
+_ACTIVE_DB_QUERY_REPORT: ContextVar["SearchReport | None"] = ContextVar(
+    "active_db_query_report", default=None
+)
+
+_DB_CACHE_SEEN_TABLES: set[str] = set()
+
+
+@dataclass(slots=True)
+class SearchReport:
+    """Detailed timing and candidate statistics for one search execution."""
+
+    mode: str
+    total_ms: float = 0.0
+    variant_resolution_ms: float = 0.0
+    # Fuzzy variant-resolution breakdown. These are nested within
+    # ``variant_resolution_ms`` and are therefore not included separately
+    # in ``accounted_ms``.
+    variant_candidate_query_ms: float = 0.0
+    variant_candidate_prepare_ms: float = 0.0
+    variant_rapidfuzz_ms: float = 0.0
+    variant_candidate_query_rows: int = 0
+    variant_candidate_term_ids: int = 0
+    variant_candidate_min_length: int | None = None
+    variant_candidate_max_length: int | None = None
+    variant_resolution: list[dict] = field(default_factory=list)
+    tantivy_ms: float = 0.0
+    tantivy_by_term: list[dict] = field(default_factory=list)
+    candidate_intersection_ms: float = 0.0
+    candidate_docs_before_positions: int = 0
+    frequency_ms: float = 0.0
+    frequency_rows: int = 0
+    frequency_docs: int = 0
+    frequency_candidate_docs: int = 0
+    anchor_selection_ms: float = 0.0
+    anchor_by_doc: list[dict] = field(default_factory=list)
+    postings_ms: float = 0.0
+    postings_terms: int = 0
+    postings_rows: int = 0
+    match_build_ms: float = 0.0
+    match_build_by_term: list[dict] = field(default_factory=list)
+    authoritative_intersection_ms: float = 0.0
+    candidate_docs_after_postings: int = 0
+    proximity_ms: float = 0.0
+    proximity_docs_checked: int = 0
+    proximity_docs_with_hits: int = 0
+    proximity_max_doc_ms: float = 0.0
+    documents_ms: float = 0.0
+    result_build_ms: float = 0.0
+    final_documents: int = 0
+
+    # LanceDB/PyArrow query instrumentation. Nested in existing search stages.
+    db_predicate_construction_ms: float = 0.0
+    db_query_setup_ms: float = 0.0
+    db_execution_ms: float = 0.0
+    db_to_pylist_ms: float = 0.0
+    db_python_object_creation_ms: float = 0.0
+    db_queries: int = 0
+    db_rows_returned: int = 0
+    db_bytes_returned: int = 0
+    db_cache_cold_queries: int = 0
+    db_cache_warm_queries: int = 0
+    db_fragment_files_touched: int | None = None
+    db_fragment_file_counts_known: int = 0
+    db_query_breakdown: list[dict] = field(default_factory=list)
+    runtime_posting_lookups: int = 0
+    runtime_posting_hits: int = 0
+    runtime_frequency_lookups: int = 0
+    runtime_frequency_hits: int = 0
+    runtime_candidate_terms: int = 0
+    runtime_source_file_reads: int = 0
+    runtime_lancedb_document_fallbacks: int = 0
+    diagnostics: list[str] = field(default_factory=list)
+
+    @property
+    def accounted_ms(self) -> float:
+        return sum(
+            (
+                self.variant_resolution_ms,
+                self.tantivy_ms,
+                self.candidate_intersection_ms,
+                self.frequency_ms,
+                self.anchor_selection_ms,
+                self.postings_ms,
+                self.match_build_ms,
+                self.authoritative_intersection_ms,
+                self.proximity_ms,
+                self.documents_ms,
+                self.result_build_ms,
+            )
+        )
+
+
+@dataclass(slots=True)
+class MatchArrays:
+    """Compact in-memory occurrence representation for one query term/doc."""
+
+    starts: np.ndarray
+    ends: np.ndarray
+    term_ids: np.ndarray
+    edit_distances: np.ndarray
+
+    @classmethod
+    def empty(cls) -> "MatchArrays":
+        return cls(
+            starts=np.empty(0, dtype=np.int32),
+            ends=np.empty(0, dtype=np.int32),
+            term_ids=np.empty(0, dtype=np.int32),
+            edit_distances=np.empty(0, dtype=np.int32),
+        )
+
+    def __len__(self) -> int:
+        return int(self.starts.size)
+
+
+@dataclass(slots=True)
+class SearchIndex:
+    db: object
+    docs: object
+    locations: object
+    postings: object
+    terms: object
+    frequencies: object
+    fts_docs: object
+    normal_terms_by_length: dict[int, list[str]]
+    additional_terms_by_length: dict[int, list[str]]
+    term_to_id: dict[tuple[str, str], int]
+    id_to_term: dict[int, tuple[str, str]]
+    term_lengths: dict[int, int]
+    doc_word_counts: dict[int, int]
+    document_metadata: dict[int, dict] = field(default_factory=dict)
+    fts_enabled: bool = False
+
+# =============================================================================
+# Tokenization and query normalization
+# =============================================================================
+
 TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
-
 
 _STANDARD_TOKEN_RE = re.compile(r"^\w+$", re.UNICODE)
 
-# Characters allowed in additional-tokenizer chunks besides normal word chars.
-# `*` and `?` are intentionally excluded because they remain wildcard operators.
 ADDITIONAL_TOKEN_SPECIALS = set(
     '!"§$%&/()_=.:;#~><°-—+,'
     "'{}[]@„“|”’‘"
@@ -160,21 +427,17 @@ ADDITIONAL_TOKEN_SPECIALS = set(
 
 _ADDITIONAL_TOKEN_SPECIALS_ESCAPED = re.escape("".join(ADDITIONAL_TOKEN_SPECIALS))
 
-# Normal word characters used by the additional tokenizer.
 _NON_WHITESPACE_TOKEN_RE = re.compile(
     rf"[\w{_ADDITIONAL_TOKEN_SPECIALS_ESCAPED}]+",
     re.UNICODE,
 )
-
 
 _ADDITIONAL_TOKEN_FULL_RE = re.compile(
     rf"^[\w{_ADDITIONAL_TOKEN_SPECIALS_ESCAPED}]+$",
     re.UNICODE,
 )
 
-
 _WORD_CHAR_RE = re.compile(r"\w", re.UNICODE)
-
 
 _ADDITIONAL_TOKEN_WRAPPER_PAIRS = {
     "(": ")",
@@ -196,7 +459,6 @@ _ADDITIONAL_TOKEN_WRAPPER_PAIRS = {
     "（": "）",
     "❮": "❯",
     "❰": "❱",
-    "❮": "❯",
     "❝": "❞",
     "⟨": "⟩",
     '"': '"',
@@ -234,7 +496,6 @@ def _is_wrapped_additional_token(token: str) -> bool:
     return _ADDITIONAL_TOKEN_FULL_RE.fullmatch(inner) is not None
 
 
-
 def iter_additional_tokens(content: str):
     """Yield complete whitespace-delimited chunks with source positions.
 
@@ -259,6 +520,7 @@ def _is_normal_token(text: str) -> bool:
     """Return True for plain word/number tokens without punctuation."""
     return bool(_STANDARD_TOKEN_RE.fullmatch(text))
 
+
 def is_indexable_additional_token(token: str) -> bool:
     """Return True for a canonical additional-token form."""
     if not token or any(char.isspace() for char in token):
@@ -271,9 +533,6 @@ def is_indexable_additional_token(token: str) -> bool:
         return True
     return _is_wrapped_additional_token(token)
 
-
-
-QueryRoute = Literal["normal", "additional", "fallback"]
 
 _EXPLICIT_PATTERN_CHARS = set(r"*?^$+|{}[]\\")
 
@@ -313,10 +572,14 @@ def classify_query(term: str) -> QueryRoute:
 
     # Ordinary closing punctuation stays a literal fallback query. A complete
     # configured wrapper pair takes precedence over regex metacharacters such
-    # as [] and {}, and is always routed through the additional-term index.
+    # as [] and {}. Wrapped plain words route through the normal-term index
+    # (their wrapper is recorded per occurrence in postings); other wrapped
+    # tokens route through the additional-term index.
     if query.rstrip(_ADDITIONAL_TRAILING_PUNCTUATION) != query:
         return "fallback"
     if _is_wrapped_additional_token(query):
+        if _STANDARD_TOKEN_RE.fullmatch(query[1:-1]):
+            return "normal"
         return "additional"
 
     canonical = canonicalize_additional_token(
@@ -566,127 +829,223 @@ def filter_case_sensitive_matches(
         edit_distances=np.asarray(kept_distances, dtype=np.int32),
     )
 
-# -----------------------------------------------------------------------------
-# Persistent schemas
-# -----------------------------------------------------------------------------
 
-DOCS_SCHEMA = pa.schema(
-    [
-        pa.field("id", pa.int32()),
-        # Compatibility/display path only. The authoritative list of physical
-        # paths lives in DOCUMENT_LOCATIONS_TABLE.
-        pa.field("path", pa.string()),
-        pa.field("sha256", pa.string()),
-        pa.field("content", pa.string()),
-        pa.field("word_count", pa.int32()),
-    ]
-)
-
-DOCUMENT_LOCATIONS_SCHEMA = pa.schema(
-    [
-        pa.field("doc_id", pa.int32()),
-        pa.field("path", pa.string()),
-    ]
-)
-
-TERMS_SCHEMA = pa.schema(
-    [
-        pa.field("term_id", pa.int32()),
-        pa.field("term_type", pa.string()),
-        pa.field("term", pa.string()),
-        pa.field("token_length", pa.int32()),
-    ]
-)
-
-POSTINGS_SCHEMA = pa.schema(
-    [
-        pa.field("doc_id", pa.int32()),
-        pa.field("term_id", pa.int32()),
-        pa.field("positions", pa.list_(pa.int32())),
-    ]
-)
-
-TERM_FREQUENCIES_SCHEMA = pa.schema(
-    [
-        pa.field("doc_id", pa.int32()),
-        pa.field("term_id", pa.int32()),
-        pa.field("occurrence_count", pa.int32()),
-    ]
-)
-
-FTS_DOCS_SCHEMA = pa.schema(
-    [
-        pa.field("doc_id", pa.int32()),
-        pa.field("term_id", pa.int32()),
-        pa.field(FTS_KEY_COLUMN, pa.string()),
-    ]
-)
-
-INDEX_TABLE_SPECS = (
-    (DOCS_TABLE, DOCS_SCHEMA),
-    (DOCUMENT_LOCATIONS_TABLE, DOCUMENT_LOCATIONS_SCHEMA),
-    (TERMS_TABLE, TERMS_SCHEMA),
-    (POSTINGS_TABLE, POSTINGS_SCHEMA),
-    (TERM_FREQUENCIES_TABLE, TERM_FREQUENCIES_SCHEMA),
-    (FTS_DOCS_TABLE, FTS_DOCS_SCHEMA),
-)
-
-# -----------------------------------------------------------------------------
-# Result/config objects
-# -----------------------------------------------------------------------------
-
-@dataclass(frozen=True, slots=True)
-class SearchConfig:
-    fuzzy_distance: int = FUZZY_DISTANCE
-    max_distance_chars: int = MAX_DISTANCE_CHARS
-    snippet_context_chars: int = SNIPPET_CONTEXT_CHARS
-    max_results_per_document: int | None = MAX_RESULTS_PER_DOCUMENT
-    # Kept for compatibility with callers that constructed SearchConfig directly.
-    # When supplied, this legacy value takes precedence over the new field.
-    max_proximity_chains_per_document: int | None = MAX_PROXIMITY_CHAINS_PER_DOCUMENT
-    case_sensitive: tuple[bool, ...] = ()
-    term_modes: tuple[TermSearchMode, ...] = ()
-
-    @property
-    def effective_max_results_per_document(self) -> int | None:
-        if self.max_proximity_chains_per_document is not None:
-            return self.max_proximity_chains_per_document
-        return self.max_results_per_document
-
-    def __post_init__(self) -> None:
-        if self.fuzzy_distance < 0:
-            raise ValueError("FUZZY_DISTANCE must be >= 0")
-        if self.max_distance_chars < 0:
-            raise ValueError("MAX_DISTANCE_CHARS must be >= 0")
-        if self.snippet_context_chars < 0:
-            raise ValueError("SNIPPET_CONTEXT_CHARS must be >= 0")
-
-        for name, value in (
-            ("MAX_RESULTS_PER_DOCUMENT", self.max_results_per_document),
-            (
-                "MAX_PROXIMITY_CHAINS_PER_DOCUMENT",
-                self.max_proximity_chains_per_document,
-            ),
-        ):
-            if value is not None and value < 1:
-                raise ValueError(f"{name} must be >= 1 or None")
+def normalize_token(token: str) -> str:
+    return token.casefold()
 
 
-@dataclass(slots=True)
-class SearchHit:
-    doc_id: int
-    document: dict
-    matches_by_term: list[list[dict]]
-    chains: list[list[dict]]
-    mode: str
-    term_modes: list[TermSearchMode] = field(default_factory=list)
+def iter_tokens(content: str):
+    for match in TOKEN_PATTERN.finditer(content):
+        yield normalize_token(match.group(0)), match.start(), match.end()
 
 
-_ACTIVE_DB_QUERY_REPORT: ContextVar["SearchReport | None"] = ContextVar(
-    "active_db_query_report", default=None
-)
-_DB_CACHE_SEEN_TABLES: set[str] = set()
+def wrapper_flag_for_span(content: str, start: int, end: int) -> str:
+    """Return the balanced wrapper pair directly surrounding one plain-word span.
 
+    ``""`` means the occurrence is not wrapped; otherwise a two-character pair
+    such as ``"()"``, ``"[]"`` or ``"«»"`` records which wrappers surrounded it.
+    """
+    if start == 0 or end >= len(content):
+        return ""
+    opening = content[start - 1]
+    closing = _ADDITIONAL_TOKEN_WRAPPER_PAIRS.get(opening)
+    if closing is not None and content[end] == closing:
+        return opening + closing
+    return ""
+
+
+def count_words(content: str) -> int:
+    """Count words using the same tokenizer as the search index."""
+
+    return sum(1 for _ in TOKEN_PATTERN.finditer(content))
+
+# =============================================================================
+# Source file access and folder scanning
+# =============================================================================
+
+def _hash_file_worker(path_str: str) -> dict:
+    """Read one source file and calculate its SHA-256 without tokenizing it.
+
+    Unlike the indexing worker, failures are raised to the caller. A failed hash
+    must abort synchronization rather than make a still-indexed file look deleted.
+    """
+    path = Path(path_str).absolute()
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "path": str(path),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _index_file_worker(path_str: str) -> dict | None:
+    """
+    Worker function to read and tokenize a single file.
+    Must be at module level for pickling in 'spawn' context.
+    
+    Returns a dict with tokenized data, or None if file failed to read.
+    """
+    path = Path(path_str)
+    try:
+        raw_bytes = path.read_bytes()
+        sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        content = raw_bytes.decode("utf-8", errors="ignore")
+        
+        # Tokenize using the same logic as iter_indexed_terms
+        normal_terms = []
+        additional_terms = []
+        
+        # Normal tokens. Each occurrence carries the wrapper pair that directly
+        # surrounds it ("" when not wrapped) so postings can annotate it.
+        for match in TOKEN_PATTERN.finditer(content):
+            token = normalize_token(match.group(0))
+            start = int(match.start())
+            end = int(match.end())
+            normal_terms.append(
+                (token, start, end, wrapper_flag_for_span(content, start, end))
+            )
+            
+        # Additional tokens. Wrapped ordinary words are indexed only under
+        # their normal term; the wrapper is recorded per occurrence instead of
+        # creating a duplicate additional-namespace entry.
+        for _normalized_chunk, start, end in iter_additional_tokens(content):
+            raw_token = content[int(start):int(end)]
+            raw_core = raw_token.rstrip(_ADDITIONAL_TRAILING_PUNCTUATION)
+            if not raw_core:
+                continue
+            canonical = canonicalize_additional_token(raw_core)
+            if not canonical or len(canonical) > FTS_MAX_CHUNK_LENGTH:
+                continue
+            wrapped = _is_wrapped_additional_token(raw_core)
+            if not is_indexable_additional_token(canonical):
+                continue
+            span_start = int(start) + (1 if wrapped else 0)
+            span_end = span_start + len(canonical)
+            flag = raw_core[0] + raw_core[-1] if wrapped else ""
+            additional_terms.append((canonical, span_start, span_end, flag))
+
+        word_count = count_words(content)
+        
+        return {
+            "path": str(path.absolute()),
+            "sha256": sha256,
+            "word_count": word_count,
+            "normal_terms": normal_terms,
+            "additional_terms": additional_terms,
+            # Original text is stored in DOCS and is required for snippets/fallback matching.
+            "content": content
+        }
+    except Exception:
+        logger.exception("Worker failed to index %s", path)
+        return None
+
+
+def _run_index_file_workers(paths: Sequence[Path], *, max_workers: int = 8) -> list[dict | None]:
+    """Read/hash/tokenize independent files using one bounded thread pool.
+
+    Workers only touch their own source file and return plain Python records.
+    All LanceDB writes happen later on the calling thread, so native database
+    objects are never shared with these workers. A bounded pool also avoids
+    the expensive process-spawn overhead on Windows GUI launches.
+    """
+    source_paths = list(paths)
+    if not source_paths:
+        return []
+    cpu_count = os.cpu_count() or 1
+    worker_count = min(max(1, int(max_workers)), cpu_count, len(source_paths))
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="text-index",
+    ) as executor:
+        # executor.map preserves input order and propagates unexpected exceptions.
+        return list(executor.map(_index_file_worker, (str(path) for path in source_paths)))
+
+
+def read_text_with_sha256(path: Path) -> tuple[str, str]:
+    raw = path.read_bytes()
+    return raw.decode("utf-8", errors="ignore"), hashlib.sha256(raw).hexdigest()
+
+
+def document_row(doc_id: int, path: Path, content: str, sha256: str) -> dict:
+    return {
+        "id": int(doc_id),
+        "path": str(path.absolute()),
+        "sha256": sha256,
+        "content": content,
+        "word_count": int(count_words(content)),
+    }
+
+
+def collect_paths(paths: Sequence[Path]) -> list[Path]:
+    return sorted(
+        {path.absolute() for path in paths},
+        key=lambda path: str(path).casefold(),
+    )
+
+
+def scan_search_folder(
+    folder: Path,
+    excluded_folder: Path,
+) -> tuple[list[Path], dict[str, tuple[int, int]]]:
+    """Safely enumerate .txt files and capture fast change-detection metadata.
+
+    A traversal/stat error aborts the scan. Callers must never interpret an
+    incomplete scan as evidence that indexed documents were deleted.
+    """
+    folder = folder.absolute()
+    excluded_folder = excluded_folder.absolute()
+    if not folder.is_dir():
+        raise OSError(f"Search folder is not accessible: {folder}")
+
+    paths: list[Path] = []
+    snapshot: dict[str, tuple[int, int]] = {}
+
+    def raise_scan_error(error: OSError) -> None:
+        raise error
+
+    for root, directory_names, file_names in os.walk(
+        folder,
+        topdown=True,
+        onerror=raise_scan_error,
+        followlinks=False,
+    ):
+        root_path = Path(root).absolute()
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if not path_in_folder((root_path / name).absolute(), excluded_folder)
+        ]
+        for file_name in file_names:
+            if Path(file_name).suffix.casefold() != ".txt":
+                continue
+            path = (root_path / file_name).absolute()
+            if path_in_folder(path, excluded_folder):
+                continue
+            stat_result = path.stat()
+            if not path.is_file():
+                continue
+            paths.append(path)
+            snapshot[str(path)] = (
+                int(stat_result.st_mtime_ns),
+                int(stat_result.st_size),
+            )
+
+    return collect_paths(paths), snapshot
+
+
+def path_in_folder(path: Path, folder: Path) -> bool:
+    """Return True when path is inside folder (including folder itself)."""
+    try:
+        path.relative_to(folder)
+        return True
+    except ValueError:
+        return False
+
+# =============================================================================
+# LanceDB persistence primitives
+# =============================================================================
 
 def _table_cache_key(table: object) -> str:
     for attr in ("name", "_name", "table_name", "_table_name"):
@@ -809,117 +1168,6 @@ def _record_predicate_construction(elapsed_ms: float) -> None:
         report.db_predicate_construction_ms += float(elapsed_ms)
 
 
-@dataclass(slots=True)
-class SearchReport:
-    """Detailed timing and candidate statistics for one search execution."""
-
-    mode: str
-    total_ms: float = 0.0
-    variant_resolution_ms: float = 0.0
-    # Fuzzy variant-resolution breakdown. These are nested within
-    # ``variant_resolution_ms`` and are therefore not included separately
-    # in ``accounted_ms``.
-    variant_candidate_query_ms: float = 0.0
-    variant_candidate_prepare_ms: float = 0.0
-    variant_rapidfuzz_ms: float = 0.0
-    variant_candidate_query_rows: int = 0
-    variant_candidate_term_ids: int = 0
-    variant_candidate_min_length: int | None = None
-    variant_candidate_max_length: int | None = None
-    variant_resolution: list[dict] = field(default_factory=list)
-    tantivy_ms: float = 0.0
-    tantivy_by_term: list[dict] = field(default_factory=list)
-    candidate_intersection_ms: float = 0.0
-    candidate_docs_before_positions: int = 0
-    frequency_ms: float = 0.0
-    frequency_rows: int = 0
-    frequency_docs: int = 0
-    frequency_candidate_docs: int = 0
-    anchor_selection_ms: float = 0.0
-    anchor_by_doc: list[dict] = field(default_factory=list)
-    postings_ms: float = 0.0
-    postings_terms: int = 0
-    postings_rows: int = 0
-    match_build_ms: float = 0.0
-    match_build_by_term: list[dict] = field(default_factory=list)
-    authoritative_intersection_ms: float = 0.0
-    candidate_docs_after_postings: int = 0
-    proximity_ms: float = 0.0
-    proximity_docs_checked: int = 0
-    proximity_docs_with_hits: int = 0
-    proximity_max_doc_ms: float = 0.0
-    documents_ms: float = 0.0
-    result_build_ms: float = 0.0
-    final_documents: int = 0
-
-    # LanceDB/PyArrow query instrumentation. Nested in existing search stages.
-    db_predicate_construction_ms: float = 0.0
-    db_query_setup_ms: float = 0.0
-    db_execution_ms: float = 0.0
-    db_to_pylist_ms: float = 0.0
-    db_python_object_creation_ms: float = 0.0
-    db_queries: int = 0
-    db_rows_returned: int = 0
-    db_bytes_returned: int = 0
-    db_cache_cold_queries: int = 0
-    db_cache_warm_queries: int = 0
-    db_fragment_files_touched: int | None = None
-    db_fragment_file_counts_known: int = 0
-    db_query_breakdown: list[dict] = field(default_factory=list)
-    runtime_posting_lookups: int = 0
-    runtime_posting_hits: int = 0
-    runtime_frequency_lookups: int = 0
-    runtime_frequency_hits: int = 0
-    runtime_candidate_terms: int = 0
-    runtime_source_file_reads: int = 0
-    runtime_lancedb_document_fallbacks: int = 0
-    diagnostics: list[str] = field(default_factory=list)
-
-    @property
-    def accounted_ms(self) -> float:
-        return sum(
-            (
-                self.variant_resolution_ms,
-                self.tantivy_ms,
-                self.candidate_intersection_ms,
-                self.frequency_ms,
-                self.anchor_selection_ms,
-                self.postings_ms,
-                self.match_build_ms,
-                self.authoritative_intersection_ms,
-                self.proximity_ms,
-                self.documents_ms,
-                self.result_build_ms,
-            )
-        )
-
-
-@dataclass(slots=True)
-class MatchArrays:
-    """Compact in-memory occurrence representation for one query term/doc."""
-
-    starts: np.ndarray
-    ends: np.ndarray
-    term_ids: np.ndarray
-    edit_distances: np.ndarray
-
-    @classmethod
-    def empty(cls) -> "MatchArrays":
-        return cls(
-            starts=np.empty(0, dtype=np.int32),
-            ends=np.empty(0, dtype=np.int32),
-            term_ids=np.empty(0, dtype=np.int32),
-            edit_distances=np.empty(0, dtype=np.int32),
-        )
-
-    def __len__(self) -> int:
-        return int(self.starts.size)
-
-
-# -----------------------------------------------------------------------------
-# Generic LanceDB helpers
-# -----------------------------------------------------------------------------
-
 def table_exists(db: object, name: str) -> bool:
     try:
         listed = db.list_tables()
@@ -946,7 +1194,6 @@ def index_schema_is_valid(db: object) -> bool:
         table_exists(db, name) and schema_matches(db.open_table(name), schema)
         for name, schema in INDEX_TABLE_SPECS
     )
-
 
 
 def rows_to_arrow(rows: Sequence[dict], schema: pa.Schema) -> pa.Table:
@@ -1086,214 +1333,38 @@ def sql_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-# -----------------------------------------------------------------------------
-# Tokenization / index construction
-# -----------------------------------------------------------------------------
-
-
-
-def _hash_file_worker(path_str: str) -> dict:
-    """Read one source file and calculate its SHA-256 without tokenizing it.
-
-    Unlike the indexing worker, failures are raised to the caller. A failed hash
-    must abort synchronization rather than make a still-indexed file look deleted.
+def query_arrow_columns(
+    table: object,
+    predicate: str | None = None,
+    columns: list[str] | None = None,
+) -> pa.Table:
     """
-    path = Path(path_str).absolute()
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return {
-        "path": str(path),
-        "sha256": digest.hexdigest(),
-    }
-
-
-def _index_file_worker(path_str: str) -> dict | None:
+    Fetch data and return the raw PyArrow Table without converting to Python lists.
+    This is critical for performance when dealing with large nested lists like positions.
     """
-    Worker function to read and tokenize a single file.
-    Must be at module level for pickling in 'spawn' context.
+    query = table.search()
+    if predicate:
+        query = query.where(predicate)
+    if columns:
+        query = query.select(columns)
     
-    Returns a dict with tokenized data, or None if file failed to read.
-    """
-    path = Path(path_str)
-    try:
-        raw_bytes = path.read_bytes()
-        sha256 = hashlib.sha256(raw_bytes).hexdigest()
-        content = raw_bytes.decode("utf-8", errors="ignore")
-        
-        # Tokenize using the same logic as iter_indexed_terms
-        normal_terms = []
-        additional_terms = []
-        
-        # Normal tokens
-        for match in TOKEN_PATTERN.finditer(content):
-            token = normalize_token(match.group(0))
-            normal_terms.append((token, int(match.start()), int(match.end())))
-            
-        # Additional tokens
-        for _normalized_chunk, start, end in iter_additional_tokens(content):
-            raw_token = content[int(start):int(end)]
-            raw_core = raw_token.rstrip(_ADDITIONAL_TRAILING_PUNCTUATION)
-            if not raw_core:
-                continue
-            canonical = canonicalize_additional_token(raw_core)
-            if not canonical or len(canonical) > FTS_MAX_CHUNK_LENGTH:
-                continue
-            wrapped = _is_wrapped_additional_token(raw_core)
-            # Wrapped ordinary words also need an additional-type posting, so
-            # a query such as “world” resolves through the index, not fallback.
-            if not is_indexable_additional_token(canonical) and not wrapped:
-                continue
-            span_start = int(start) + (1 if wrapped else 0)
-            span_end = span_start + len(canonical)
-            additional_terms.append((canonical, span_start, span_end))
+    # Return the Arrow Table directly
+    return query.to_arrow()
 
-        word_count = count_words(content)
-        
-        return {
-            "path": str(path.absolute()),
-            "sha256": sha256,
-            "word_count": word_count,
-            "normal_terms": normal_terms,
-            "additional_terms": additional_terms,
-            # We do NOT return content here to save memory/bandwidth if possible?
-            # But we need content to build postings in main process? 
-            # Actually, postings are built from terms + positions. 
-            # We have (term, start, end). That's enough for postings.
-            # However, FTS keys and snippets might need original text?
-            # The current code stores `content` in the DB. 
-            # To keep it simple and safe, let's return content too if file size is reasonable.
-            # For very large files, this could be an issue. 
-            # Given the context of "text search engine", assuming manageable sizes.
-            "content": content
-        }
-    except Exception:
-        logger.exception("Worker failed to index %s", path)
-        return None
-
-
-def _run_index_file_workers(paths: Sequence[Path], *, max_workers: int = 8) -> list[dict | None]:
-    """Read/hash/tokenize independent files using one bounded thread pool.
-
-    Workers only touch their own source file and return plain Python records.
-    All LanceDB writes happen later on the calling thread, so native database
-    objects are never shared with these workers. A bounded pool also avoids
-    the expensive process-spawn overhead on Windows GUI launches.
-    """
-    source_paths = list(paths)
-    if not source_paths:
-        return []
-    cpu_count = os.cpu_count() or 1
-    worker_count = min(max(1, int(max_workers)), cpu_count, len(source_paths))
-    with ThreadPoolExecutor(
-        max_workers=worker_count,
-        thread_name_prefix="text-index",
-    ) as executor:
-        # executor.map preserves input order and propagates unexpected exceptions.
-        return list(executor.map(_index_file_worker, (str(path) for path in source_paths)))
-
-
-def normalize_token(token: str) -> str:
-    return token.casefold()
-
-
-def iter_tokens(content: str):
-    for match in TOKEN_PATTERN.finditer(content):
-        yield normalize_token(match.group(0)), match.start(), match.end()
-
-
-def count_words(content: str) -> int:
-    """Count words using the same tokenizer as the search index."""
-
-    return sum(1 for _ in TOKEN_PATTERN.finditer(content))
-
-
-def read_text_with_sha256(path: Path) -> tuple[str, str]:
-    raw = path.read_bytes()
-    return raw.decode("utf-8", errors="ignore"), hashlib.sha256(raw).hexdigest()
-
-
-def document_row(doc_id: int, path: Path, content: str, sha256: str) -> dict:
-    return {
-        "id": int(doc_id),
-        "path": str(path.absolute()),
-        "sha256": sha256,
-        "content": content,
-        "word_count": int(count_words(content)),
-    }
-
-
-def collect_paths(paths: Sequence[Path]) -> list[Path]:
-    return sorted(
-        {path.absolute() for path in paths},
-        key=lambda path: str(path).casefold(),
-    )
-
-
-def scan_search_folder(
-    folder: Path,
-    excluded_folder: Path,
-) -> tuple[list[Path], dict[str, tuple[int, int]]]:
-    """Safely enumerate .txt files and capture fast change-detection metadata.
-
-    A traversal/stat error aborts the scan. Callers must never interpret an
-    incomplete scan as evidence that indexed documents were deleted.
-    """
-    folder = folder.absolute()
-    excluded_folder = excluded_folder.absolute()
-    if not folder.is_dir():
-        raise OSError(f"Search folder is not accessible: {folder}")
-
-    paths: list[Path] = []
-    snapshot: dict[str, tuple[int, int]] = {}
-
-    def raise_scan_error(error: OSError) -> None:
-        raise error
-
-    for root, directory_names, file_names in os.walk(
-        folder,
-        topdown=True,
-        onerror=raise_scan_error,
-        followlinks=False,
-    ):
-        root_path = Path(root).absolute()
-        directory_names[:] = [
-            name
-            for name in directory_names
-            if not path_in_folder((root_path / name).absolute(), excluded_folder)
-        ]
-        for file_name in file_names:
-            if Path(file_name).suffix.casefold() != ".txt":
-                continue
-            path = (root_path / file_name).absolute()
-            if path_in_folder(path, excluded_folder):
-                continue
-            stat_result = path.stat()
-            if not path.is_file():
-                continue
-            paths.append(path)
-            snapshot[str(path)] = (
-                int(stat_result.st_mtime_ns),
-                int(stat_result.st_size),
-            )
-
-    return collect_paths(paths), snapshot
-
-
-def path_in_folder(path: Path, folder: Path) -> bool:
-    """Return True when path is inside folder (including folder itself)."""
-    try:
-        path.relative_to(folder)
-        return True
-    except ValueError:
-        return False
-
+# =============================================================================
+# Index construction and term/posting storage
+# =============================================================================
 
 def iter_indexed_terms(content: str):
-    """Yield ``(term_type, normalized_term, start, end)`` for persistent terms."""
+    """Yield ``(term_type, normalized_term, start, end, wrapper_flag)``."""
     for token, start, end in iter_tokens(content):
-        yield "normal", token, int(start), int(end)
+        yield (
+            "normal",
+            token,
+            int(start),
+            int(end),
+            wrapper_flag_for_span(content, int(start), int(end)),
+        )
 
     for _normalized_chunk, start, end in iter_additional_tokens(content):
         raw_token = content[int(start):int(end)]
@@ -1304,18 +1375,21 @@ def iter_indexed_terms(content: str):
         if not canonical or len(canonical) > FTS_MAX_CHUNK_LENGTH:
             continue
         wrapped = _is_wrapped_additional_token(raw_core)
-        # Keep wrapped ordinary words in the additional namespace as well.
-        if not is_indexable_additional_token(canonical) and not wrapped:
+        # Wrapped ordinary words are indexed only under their normal term;
+        # the wrapper is recorded per occurrence instead.
+        if not is_indexable_additional_token(canonical):
             continue
         span_start = int(start) + (1 if wrapped else 0)
         span_end = span_start + len(canonical)
-        yield "additional", canonical, span_start, int(span_end)
+        yield "additional", canonical, span_start, int(span_end), (
+            raw_core[0] + raw_core[-1] if wrapped else ""
+        )
 
 
 def indexed_term_keys(content: str) -> set[TermKey]:
     return {
         (str(term_type), str(term))
-        for term_type, term, _start, _end in iter_indexed_terms(content)
+        for term_type, term, _start, _end, _flag in iter_indexed_terms(content)
     }
 
 
@@ -1333,17 +1407,20 @@ def build_postings_for_document(
     term_to_id: dict[TermKey, int],
 ) -> list[dict]:
     spans_by_term: dict[int, list[int]] = {}
-    for term_type, term, start, end in iter_indexed_terms(content):
+    flags_by_term: dict[int, list[str]] = {}
+    for term_type, term, start, end, flag in iter_indexed_terms(content):
         term_id = term_to_id[(term_type, term)]
         spans_by_term.setdefault(term_id, []).extend(
             (int(start), int(end - start))
         )
+        flags_by_term.setdefault(term_id, []).append(flag)
 
     return [
         {
             "doc_id": int(doc_id),
             "term_id": int(term_id),
             "positions": np.asarray(flat_positions, dtype=np.int32),
+            "wrapper_flags": list(flags_by_term[term_id]),
         }
         for term_id, flat_positions in sorted(spans_by_term.items())
     ]
@@ -1419,10 +1496,338 @@ def refresh_fts_index(table: object) -> bool:
     return False
 
 
+def create_empty_index(db: object):
+    """Create the current schema and remove superseded persistent tables."""
+    for name, _schema in INDEX_TABLE_SPECS:
+        if table_exists(db, name):
+            db.drop_table(name)
 
-# -----------------------------------------------------------------------------
-# FTS/Tantivy candidate filtering
-# -----------------------------------------------------------------------------
+    return (
+        db.create_table(DOCS_TABLE, schema=DOCS_SCHEMA),
+        db.create_table(DOCUMENT_LOCATIONS_TABLE, schema=DOCUMENT_LOCATIONS_SCHEMA),
+        db.create_table(POSTINGS_TABLE, schema=POSTINGS_SCHEMA),
+        db.create_table(TERMS_TABLE, schema=TERMS_SCHEMA),
+        db.create_table(TERM_FREQUENCIES_TABLE, schema=TERM_FREQUENCIES_SCHEMA),
+        db.create_table(FTS_DOCS_TABLE, schema=FTS_DOCS_SCHEMA),
+    )
+
+
+def rebuild_index(
+    db: object,
+    paths: list[Path],
+    *,
+    progress_callback: ProgressCallback | None = None,
+):
+    """Clean rebuild with one indexed document per distinct SHA-256.
+
+    File reading, hashing, and tokenization use a bounded thread pool. All
+    LanceDB table creation and writes remain sequential on the calling thread.
+    """
+    source_paths = collect_paths(paths)
+    _notify_progress(progress_callback, "Reading text files", 0.0)
+
+    if not source_paths:
+        (
+            docs,
+            locations,
+            postings,
+            terms,
+            frequencies,
+            fts_docs,
+        ) = create_empty_index(db)
+        return docs, locations, postings, terms, frequencies, fts_docs, {}, False, {}
+
+    # File workers never touch LanceDB. Keep them in one bounded thread pool;
+    # all database table creation/writes below remain on the calling thread.
+    max_workers = min(8, os.cpu_count() or 1, len(source_paths))
+    _notify_progress(
+        progress_callback,
+        f"Indexing {len(source_paths)} files with {max_workers} worker thread(s)",
+        0.1,
+    )
+    results = _run_index_file_workers(source_paths, max_workers=max_workers)
+
+    _notify_progress(progress_callback, "Processing indexed results", 0.40)
+
+    # Fail closed: do not publish a partially indexed folder. This check occurs
+    # before any existing table is dropped, so an unreadable source cannot leave
+    # the persistent index half-rebuilt.
+    failed_paths = [
+        str(path)
+        for path, result in zip(source_paths, results)
+        if result is None
+    ]
+    if failed_paths:
+        preview = ", ".join(repr(path) for path in failed_paths[:5])
+        more = " ..." if len(failed_paths) > 5 else ""
+        raise RuntimeError(
+            f"Could not read/tokenize {len(failed_paths)} source file(s): {preview}{more}. "
+            "The existing index was not replaced."
+        )
+    valid_results = [result for result in results if result is not None]
+    if not valid_results:
+        # Non-empty input with no results is not a successful empty rebuild.
+        raise RuntimeError("No source files were successfully indexed; the existing index was not replaced.")
+
+    # Group by SHA-256 to deduplicate content
+    groups: dict[str, dict] = {}
+    for result in valid_results:
+        sha = result["sha256"]
+        if sha not in groups:
+            groups[sha] = {
+                "content": result["content"],
+                "paths": [result["path"]],
+                "word_count": result["word_count"],
+                # We need to merge terms from all copies? 
+                # No, term sets are identical for same content. 
+                # But positions might differ if file was modified? 
+                # Wait, SHA-256 ensures content is identical. So terms/positions are identical.
+                "normal_terms": result["normal_terms"],
+                "additional_terms": result["additional_terms"]
+            }
+        else:
+            groups[sha]["paths"].append(result["path"])
+
+    # Prepare documents and locations
+    documents: list[dict] = []
+    location_rows: list[dict] = []
+    
+    # Stable IDs: sort by first path case-insensitively
+    ordered_groups = sorted(
+        groups.items(),
+        key=lambda item: str(min(item[1]["paths"], key=lambda v: str(v).casefold())).casefold()
+    )
+    
+    for doc_id, (sha256, group) in enumerate(ordered_groups):
+        group_paths = sorted(group["paths"], key=lambda v: str(v).casefold())
+        representative = group_paths[0]
+        content = group["content"]
+        
+        documents.append(document_row(doc_id, Path(representative), content, sha256))
+        location_rows.extend(
+            {"doc_id": int(doc_id), "path": p} for p in group_paths
+        )
+
+    # Create/Replace Tables
+    (
+        docs,
+        locations,
+        postings_table,
+        terms_table,
+        frequencies_table,
+        fts_table,
+    ) = create_empty_index(db)
+
+    _notify_progress(progress_callback, "Building unique-content terms", 0.55)
+    
+    # Assign Term IDs from the collected tokenized data
+    term_to_id: dict[TermKey, int] = {}
+    all_terms: set[TermKey] = set()
+    
+    for doc in documents:
+        # We need to reconstruct the term keys from the worker output
+        # Worker returned (term, start, end). We just need unique terms.
+        sha = doc["sha256"]
+        group = groups[sha]
+        
+        for term, _s, _e, _f in group["normal_terms"]:
+            all_terms.add(("normal", term))
+        for term, _s, _e, _f in group["additional_terms"]:
+            all_terms.add(("additional", term))
+            
+    # Sort for deterministic IDs
+    sorted_terms = sorted(all_terms)
+    for i, term_key in enumerate(sorted_terms):
+        term_to_id[term_key] = i
+
+    term_rows = [
+        {
+            "term_id": int(term_id),
+            "term_type": str(term_key[0]),
+            "term": term_key[1],
+            "token_length": int(len(term_key[1])),
+        }
+        for term_key, term_id in sorted(term_to_id.items(), key=lambda item: item[1])
+    ]
+    add_rows(terms_table, term_rows, TERMS_SCHEMA)
+
+    # Build Postings and Frequencies using the pre-tokenized data
+    postings: list[dict] = []
+    frequencies: list[dict] = []
+    fts_rows: list[dict] = []
+    doc_word_counts: dict[int, int] = {}
+    
+    for document in documents:
+        doc_id = int(document["id"])
+        sha = document["sha256"]
+        group = groups[sha]
+        
+        # Reconstruct postings from worker terms
+        spans_by_term: dict[int, list[int]] = {}
+        flags_by_term: dict[int, list[str]] = {}
+        
+        for term, start, end, flag in group["normal_terms"]:
+            term_id = term_to_id[("normal", term)]
+            spans_by_term.setdefault(term_id, []).extend((int(start), int(end - start)))
+            flags_by_term.setdefault(term_id, []).append(flag)
+            
+        for term, start, end, flag in group["additional_terms"]:
+            term_id = term_to_id[("additional", term)]
+            spans_by_term.setdefault(term_id, []).extend((int(start), int(end - start)))
+            flags_by_term.setdefault(term_id, []).append(flag)
+
+        doc_postings = [
+            {
+                "doc_id": int(doc_id),
+                "term_id": int(term_id),
+                "positions": np.asarray(flat_positions, dtype=np.int32),
+                "wrapper_flags": list(flags_by_term[term_id]),
+            }
+            for term_id, flat_positions in sorted(spans_by_term.items())
+        ]
+        
+        postings.extend(doc_postings)
+        frequencies.extend(frequency_rows_from_postings(doc_postings))
+        doc_word_counts[doc_id] = int(group["word_count"])
+        
+        # FTS rows: one per distinct term in this doc
+        fts_keys = set()
+        for term, _s, _e, _f in group["normal_terms"]:
+            if len(term) <= FTS_MAX_CHUNK_LENGTH:
+                fts_keys.add(encode_literal_fts_key(term))
+        for term, _s, _e, _f in group["additional_terms"]:
+            if len(term) <= FTS_MAX_CHUNK_LENGTH:
+                fts_keys.add(encode_literal_fts_key(term))
+                
+        # We need term_ids for FTS rows. 
+        # Let's just use the unique terms from this doc.
+        doc_term_keys = set()
+        for term, _s, _e, _f in group["normal_terms"]:
+            doc_term_keys.add(("normal", term))
+        for term, _s, _e, _f in group["additional_terms"]:
+            doc_term_keys.add(("additional", term))
+            
+        for key in sorted(doc_term_keys):
+            if len(key[1]) <= FTS_MAX_CHUNK_LENGTH:
+                fts_rows.append({
+                    "doc_id": int(doc_id),
+                    "term_id": int(term_to_id[key]),
+                    FTS_KEY_COLUMN: encode_literal_fts_key(key[1]),
+                })
+
+    _notify_progress(progress_callback, "Writing unique-content index", 0.75)
+    add_rows(docs, documents, DOCS_SCHEMA)
+    add_rows(locations, location_rows, DOCUMENT_LOCATIONS_SCHEMA)
+    add_rows(postings_table, postings, POSTINGS_SCHEMA)
+    add_rows(frequencies_table, frequencies, TERM_FREQUENCIES_SCHEMA)
+    
+    _notify_progress(progress_callback, "Writing FTS entries", 0.90)
+    add_rows(fts_table, fts_rows, FTS_DOCS_SCHEMA)
+    
+    _notify_progress(progress_callback, "Creating FTS index", 0.95)
+    fts_enabled = refresh_fts_index(fts_table)
+    _notify_progress(progress_callback, "Indexing complete", 1.0)
+
+    return (
+        docs,
+        locations,
+        postings_table,
+        terms_table,
+        frequencies_table,
+        fts_table,
+        term_to_id,
+        fts_enabled,
+        doc_word_counts,
+    )
+
+
+def remove_unused_terms(index: "SearchIndex", affected_term_ids: set[int]) -> set[int]:
+    """Delete term rows that no longer have any unified postings."""
+    if not affected_term_ids:
+        return set()
+
+    surviving: set[int] = set()
+    ids = sorted(int(value) for value in affected_term_ids)
+    for offset in range(0, len(ids), 500):
+        rows = query_rows_in(
+            index.postings,
+            "term_id",
+            ids[offset : offset + 500],
+            ["term_id"],
+            operation="Find surviving term IDs",
+        )
+        surviving.update(int(row["term_id"]) for row in rows)
+
+    obsolete = affected_term_ids - surviving
+    if obsolete:
+        delete_rows_in(index.terms, "term_id", sorted(obsolete))
+        for term_id in obsolete:
+            key = index.id_to_term.pop(int(term_id), None)
+            if key is None:
+                index.term_lengths.pop(int(term_id), None)
+                continue
+            index.term_to_id.pop(key, None)
+            term_type, term = key
+            target = (
+                index.normal_terms_by_length
+                if term_type == "normal"
+                else index.additional_terms_by_length
+            )
+            values = target.get(len(term))
+            if values is not None:
+                try:
+                    values.remove(term)
+                except ValueError:
+                    pass
+                if not values:
+                    target.pop(len(term), None)
+            index.term_lengths.pop(int(term_id), None)
+    return obsolete
+
+
+def build_runtime_search_caches(
+    docs_table: object,
+    locations_table: object | None = None,
+) -> tuple[dict[int, dict], dict[int, int]]:
+    """Cache unique-content metadata plus every physical source location."""
+    metadata_rows = query_rows(
+        docs_table,
+        columns=["id", "path", "sha256", "word_count"],
+        operation="Runtime unique-document metadata load",
+    )
+    locations_by_doc: dict[int, list[str]] = {}
+    if locations_table is not None:
+        location_rows = query_rows(
+            locations_table,
+            columns=["doc_id", "path"],
+            operation="Runtime document-location load",
+        )
+        for row in location_rows:
+            locations_by_doc.setdefault(int(row["doc_id"]), []).append(
+                str(Path(row["path"]).absolute())
+            )
+
+    document_metadata: dict[int, dict] = {}
+    doc_word_counts: dict[int, int] = {}
+    for row in metadata_rows:
+        doc_id = int(row["id"])
+        locations = sorted(set(locations_by_doc.get(doc_id, [])), key=str.casefold)
+        stored_path = str(row["path"])
+        if not locations and stored_path:
+            locations = [stored_path]
+        document_metadata[doc_id] = {
+            "id": doc_id,
+            "path": locations[0] if locations else stored_path,
+            "sha256": str(row["sha256"]),
+            "locations": locations,
+            "location_count": len(locations),
+        }
+        doc_word_counts[doc_id] = int(row.get("word_count", 0) or 0)
+    return document_metadata, doc_word_counts
+
+# =============================================================================
+# Full-text-search candidate acceleration
+# =============================================================================
 
 def _has_regex_syntax_except_wildcards(term: str) -> bool:
     return any(char in "\\.^$+{}[]|()" for char in term)
@@ -1625,13 +2030,9 @@ def fts_candidate_docs(
     report.candidate_docs_before_positions = len(candidate_docs or set())
     return candidate_docs or set()
 
-
-
-
-
-# -----------------------------------------------------------------------------
-# Vocabulary / variant resolution
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Vocabulary resolution and search planning
+# =============================================================================
 
 def load_terms(
     table: object,
@@ -1733,6 +2134,10 @@ def resolve_variants(
         return {}
 
     normalized = query.casefold()
+    if term_type == "normal":
+        # Wrapped plain-word queries such as "(hello)" resolve through the
+        # normal namespace; canonicalization strips the wrapper pair.
+        normalized = _strip_additional_wrapper(normalized)
     term_map = (
         index.normal_terms_by_length
         if term_type == "normal"
@@ -1754,9 +2159,9 @@ def resolve_variants(
 
     if term_type == "normal" and mode == "regex":
         if (
-            not _has_regex_syntax_except_wildcards(query)
-            and "*" not in query
-            and "?" not in query
+            not _has_regex_syntax_except_wildcards(normalized)
+            and "*" not in normalized
+            and "?" not in normalized
         ):
             term_id = index.term_to_id.get(("normal", normalized))
             return {int(term_id): 0} if term_id is not None else {}
@@ -1923,11 +2328,6 @@ def resolve_query_terms(
     return variants_by_term, routes, fallback_flags
 
 
-
-# -----------------------------------------------------------------------------
-# Lightweight frequency planning
-# -----------------------------------------------------------------------------
-
 def fetch_term_frequencies(
     index: "SearchIndex",
     query_terms: list[str],
@@ -2007,29 +2407,9 @@ def choose_anchors(
         }
     return anchors
 
-
-# -----------------------------------------------------------------------------
-# Compact positional postings
-# -----------------------------------------------------------------------------
-
-def query_arrow_columns(
-    table: object,
-    predicate: str | None = None,
-    columns: list[str] | None = None,
-) -> pa.Table:
-    """
-    Fetch data and return the raw PyArrow Table without converting to Python lists.
-    This is critical for performance when dealing with large nested lists like positions.
-    """
-    query = table.search()
-    if predicate:
-        query = query.where(predicate)
-    if columns:
-        query = query.select(columns)
-    
-    # Return the Arrow Table directly
-    return query.to_arrow()
-
+# =============================================================================
+# Positional postings and proximity matching
+# =============================================================================
 
 def fetch_postings(
     index: "SearchIndex",
@@ -2112,9 +2492,6 @@ def fetch_postings(
         grouped.setdefault(term_id, {})
         
     return grouped
-
-
-
 
 
 def build_match_arrays(
@@ -2223,10 +2600,6 @@ def build_matches_for_document(
         )
     return output
 
-
-# -----------------------------------------------------------------------------
-# NumPy proximity engine
-# -----------------------------------------------------------------------------
 
 def distance_between(first: dict, second: dict) -> int:
     if first["end"] <= second["start"]:
@@ -2457,17 +2830,14 @@ def rank_and_limit_chains(
         ranked = ranked[:max_results_per_document]
     return ranked, score
 
-
-# -----------------------------------------------------------------------------
-# Snippets and result documents
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Snippet extraction and document retrieval
+# =============================================================================
 
 MATCH_MARKER_OPEN = "\ue000"
+
 MATCH_MARKER_CLOSE = "\ue001"
 
-
-
-# but map to U+2022 (bullet) instead of space since we keep formatting intact.
 _CONTROL_TO_BULLET = str.maketrans(
     {
         ch: "\u2022"
@@ -2520,8 +2890,6 @@ def build_snippet(content: str, chain: list[dict], context_chars: int) -> str:
     prefix = "\n..." if snippet_start else ""
     suffix = "...\n" if snippet_end < len(content) else ""
     return prefix + snippet + suffix
-
-
 
 
 def fetch_documents(
@@ -2595,297 +2963,9 @@ def fetch_documents(
 
     return documents
 
-
-# -----------------------------------------------------------------------------
-# incremental synchronization
-# -----------------------------------------------------------------------------
-
-
-def create_empty_index(db: object):
-    """Create the current schema and remove superseded persistent tables."""
-    for name, _schema in INDEX_TABLE_SPECS:
-        if table_exists(db, name):
-            db.drop_table(name)
-
-    return (
-        db.create_table(DOCS_TABLE, schema=DOCS_SCHEMA),
-        db.create_table(DOCUMENT_LOCATIONS_TABLE, schema=DOCUMENT_LOCATIONS_SCHEMA),
-        db.create_table(POSTINGS_TABLE, schema=POSTINGS_SCHEMA),
-        db.create_table(TERMS_TABLE, schema=TERMS_SCHEMA),
-        db.create_table(TERM_FREQUENCIES_TABLE, schema=TERM_FREQUENCIES_SCHEMA),
-        db.create_table(FTS_DOCS_TABLE, schema=FTS_DOCS_SCHEMA),
-    )
-
-
-
-def rebuild_index(
-    db: object,
-    paths: list[Path],
-    *,
-    progress_callback: ProgressCallback | None = None,
-):
-    """Clean rebuild with one indexed document per distinct SHA-256.
-
-    File reading, hashing, and tokenization use a bounded thread pool. All
-    LanceDB table creation and writes remain sequential on the calling thread.
-    """
-    source_paths = collect_paths(paths)
-    _notify_progress(progress_callback, "Reading text files", 0.0)
-
-    if not source_paths:
-        (
-            docs,
-            locations,
-            postings,
-            terms,
-            frequencies,
-            fts_docs,
-        ) = create_empty_index(db)
-        return docs, locations, postings, terms, frequencies, fts_docs, {}, False, {}
-
-    # File workers never touch LanceDB. Keep them in one bounded thread pool;
-    # all database table creation/writes below remain on the calling thread.
-    max_workers = min(8, os.cpu_count() or 1, len(source_paths))
-    _notify_progress(
-        progress_callback,
-        f"Indexing {len(source_paths)} files with {max_workers} worker thread(s)",
-        0.1,
-    )
-    results = _run_index_file_workers(source_paths, max_workers=max_workers)
-
-    _notify_progress(progress_callback, "Processing indexed results", 0.40)
-
-    # Fail closed: do not publish a partially indexed folder. This check occurs
-    # before any existing table is dropped, so an unreadable source cannot leave
-    # the persistent index half-rebuilt.
-    failed_paths = [
-        str(path)
-        for path, result in zip(source_paths, results)
-        if result is None
-    ]
-    if failed_paths:
-        preview = ", ".join(repr(path) for path in failed_paths[:5])
-        more = " ..." if len(failed_paths) > 5 else ""
-        raise RuntimeError(
-            f"Could not read/tokenize {len(failed_paths)} source file(s): {preview}{more}. "
-            "The existing index was not replaced."
-        )
-    valid_results = [result for result in results if result is not None]
-    if not valid_results:
-        # Non-empty input with no results is not a successful empty rebuild.
-        raise RuntimeError("No source files were successfully indexed; the existing index was not replaced.")
-
-    # Group by SHA-256 to deduplicate content
-    groups: dict[str, dict] = {}
-    for result in valid_results:
-        sha = result["sha256"]
-        if sha not in groups:
-            groups[sha] = {
-                "content": result["content"],
-                "paths": [result["path"]],
-                "word_count": result["word_count"],
-                # We need to merge terms from all copies? 
-                # No, term sets are identical for same content. 
-                # But positions might differ if file was modified? 
-                # Wait, SHA-256 ensures content is identical. So terms/positions are identical.
-                "normal_terms": result["normal_terms"],
-                "additional_terms": result["additional_terms"]
-            }
-        else:
-            groups[sha]["paths"].append(result["path"])
-
-    # Prepare documents and locations
-    documents: list[dict] = []
-    location_rows: list[dict] = []
-    
-    # Stable IDs: sort by first path case-insensitively
-    ordered_groups = sorted(
-        groups.items(),
-        key=lambda item: str(min(item[1]["paths"], key=lambda v: str(v).casefold())).casefold()
-    )
-    
-    for doc_id, (sha256, group) in enumerate(ordered_groups):
-        group_paths = sorted(group["paths"], key=lambda v: str(v).casefold())
-        representative = group_paths[0]
-        content = group["content"]
-        
-        documents.append(document_row(doc_id, Path(representative), content, sha256))
-        location_rows.extend(
-            {"doc_id": int(doc_id), "path": p} for p in group_paths
-        )
-
-    # Create/Replace Tables
-    (
-        docs,
-        locations,
-        postings_table,
-        terms_table,
-        frequencies_table,
-        fts_table,
-    ) = create_empty_index(db)
-
-    _notify_progress(progress_callback, "Building unique-content terms", 0.55)
-    
-    # Assign Term IDs from the collected tokenized data
-    term_to_id: dict[TermKey, int] = {}
-    all_terms: set[TermKey] = set()
-    
-    for doc in documents:
-        # We need to reconstruct the term keys from the worker output
-        # Worker returned (term, start, end). We just need unique terms.
-        sha = doc["sha256"]
-        group = groups[sha]
-        
-        for term, _s, _e in group["normal_terms"]:
-            all_terms.add(("normal", term))
-        for term, _s, _e in group["additional_terms"]:
-            all_terms.add(("additional", term))
-            
-    # Sort for deterministic IDs
-    sorted_terms = sorted(all_terms)
-    for i, term_key in enumerate(sorted_terms):
-        term_to_id[term_key] = i
-
-    term_rows = [
-        {
-            "term_id": int(term_id),
-            "term_type": str(term_key[0]),
-            "term": term_key[1],
-            "token_length": int(len(term_key[1])),
-        }
-        for term_key, term_id in sorted(term_to_id.items(), key=lambda item: item[1])
-    ]
-    add_rows(terms_table, term_rows, TERMS_SCHEMA)
-
-    # Build Postings and Frequencies using the pre-tokenized data
-    postings: list[dict] = []
-    frequencies: list[dict] = []
-    fts_rows: list[dict] = []
-    doc_word_counts: dict[int, int] = {}
-    
-    for document in documents:
-        doc_id = int(document["id"])
-        sha = document["sha256"]
-        group = groups[sha]
-        
-        # Reconstruct postings from worker terms
-        spans_by_term: dict[int, list[int]] = {}
-        
-        for term, start, end in group["normal_terms"]:
-            term_id = term_to_id[("normal", term)]
-            spans_by_term.setdefault(term_id, []).extend((int(start), int(end - start)))
-            
-        for term, start, end in group["additional_terms"]:
-            term_id = term_to_id[("additional", term)]
-            spans_by_term.setdefault(term_id, []).extend((int(start), int(end - start)))
-
-        doc_postings = [
-            {
-                "doc_id": int(doc_id),
-                "term_id": int(term_id),
-                "positions": np.asarray(flat_positions, dtype=np.int32),
-            }
-            for term_id, flat_positions in sorted(spans_by_term.items())
-        ]
-        
-        postings.extend(doc_postings)
-        frequencies.extend(frequency_rows_from_postings(doc_postings))
-        doc_word_counts[doc_id] = int(group["word_count"])
-        
-        # FTS rows: one per distinct term in this doc
-        fts_keys = set()
-        for term, _s, _e in group["normal_terms"]:
-            if len(term) <= FTS_MAX_CHUNK_LENGTH:
-                fts_keys.add(encode_literal_fts_key(term))
-        for term, _s, _e in group["additional_terms"]:
-            if len(term) <= FTS_MAX_CHUNK_LENGTH:
-                fts_keys.add(encode_literal_fts_key(term))
-                
-        # We need term_ids for FTS rows. 
-        # Let's just use the unique terms from this doc.
-        doc_term_keys = set()
-        for term, _s, _e in group["normal_terms"]:
-            doc_term_keys.add(("normal", term))
-        for term, _s, _e in group["additional_terms"]:
-            doc_term_keys.add(("additional", term))
-            
-        for key in sorted(doc_term_keys):
-            if len(key[1]) <= FTS_MAX_CHUNK_LENGTH:
-                fts_rows.append({
-                    "doc_id": int(doc_id),
-                    "term_id": int(term_to_id[key]),
-                    FTS_KEY_COLUMN: encode_literal_fts_key(key[1]),
-                })
-
-    _notify_progress(progress_callback, "Writing unique-content index", 0.75)
-    add_rows(docs, documents, DOCS_SCHEMA)
-    add_rows(locations, location_rows, DOCUMENT_LOCATIONS_SCHEMA)
-    add_rows(postings_table, postings, POSTINGS_SCHEMA)
-    add_rows(frequencies_table, frequencies, TERM_FREQUENCIES_SCHEMA)
-    
-    _notify_progress(progress_callback, "Writing FTS entries", 0.90)
-    add_rows(fts_table, fts_rows, FTS_DOCS_SCHEMA)
-    
-    _notify_progress(progress_callback, "Creating FTS index", 0.95)
-    fts_enabled = refresh_fts_index(fts_table)
-    _notify_progress(progress_callback, "Indexing complete", 1.0)
-
-    return (
-        docs,
-        locations,
-        postings_table,
-        terms_table,
-        frequencies_table,
-        fts_table,
-        term_to_id,
-        fts_enabled,
-        doc_word_counts,
-    )
-
-def remove_unused_terms(index: "SearchIndex", affected_term_ids: set[int]) -> set[int]:
-    """Delete term rows that no longer have any unified postings."""
-    if not affected_term_ids:
-        return set()
-
-    surviving: set[int] = set()
-    ids = sorted(int(value) for value in affected_term_ids)
-    for offset in range(0, len(ids), 500):
-        rows = query_rows_in(
-            index.postings,
-            "term_id",
-            ids[offset : offset + 500],
-            ["term_id"],
-            operation="Find surviving term IDs",
-        )
-        surviving.update(int(row["term_id"]) for row in rows)
-
-    obsolete = affected_term_ids - surviving
-    if obsolete:
-        delete_rows_in(index.terms, "term_id", sorted(obsolete))
-        for term_id in obsolete:
-            key = index.id_to_term.pop(int(term_id), None)
-            if key is None:
-                index.term_lengths.pop(int(term_id), None)
-                continue
-            index.term_to_id.pop(key, None)
-            term_type, term = key
-            target = (
-                index.normal_terms_by_length
-                if term_type == "normal"
-                else index.additional_terms_by_length
-            )
-            values = target.get(len(term))
-            if values is not None:
-                try:
-                    values.remove(term)
-                except ValueError:
-                    pass
-                if not values:
-                    target.pop(len(term), None)
-            index.term_lengths.pop(int(term_id), None)
-    return obsolete
-
-
+# =============================================================================
+# Database maintenance
+# =============================================================================
 
 def _cleanup_old_versions_for_table(table: object) -> object | None:
     """Delete superseded Lance table versions and their unreferenced files."""
@@ -2963,7 +3043,6 @@ def _compactable_table_names() -> tuple[str, ...]:
     )
 
 
-
 def cleanup_lancedb_versions(db: object) -> dict[str, int]:
     """Prune superseded LanceDB versions without compacting live data."""
     removed_bytes = 0
@@ -2983,6 +3062,9 @@ def cleanup_lancedb_versions(db: object) -> dict[str, int]:
         "bytes_removed": removed_bytes,
     }
 
+# =============================================================================
+# Incremental synchronization
+# =============================================================================
 
 def sync_index(
     index: "SearchIndex",
@@ -3348,8 +3430,8 @@ def sync_index(
     for document in changed_docs + added_docs:
         sha256 = str(document["sha256"])
         group = groups[sha256]
-        pending_terms.update(("normal", term) for term, _s, _e in group["normal_terms"])
-        pending_terms.update(("additional", term) for term, _s, _e in group["additional_terms"])
+        pending_terms.update(("normal", term) for term, _s, _e, _f in group["normal_terms"])
+        pending_terms.update(("additional", term) for term, _s, _e, _f in group["additional_terms"])
 
     next_term_id = max(index.term_to_id.values(), default=-1) + 1
     new_terms: list[tuple[TermKey, int]] = []
@@ -3393,18 +3475,22 @@ def sync_index(
         sha256 = str(document["sha256"])
         group = groups[sha256]
         spans_by_term: dict[int, list[int]] = {}
-        for term, start, end in group["normal_terms"]:
+        flags_by_term: dict[int, list[str]] = {}
+        for term, start, end, flag in group["normal_terms"]:
             term_id = index.term_to_id[("normal", term)]
             spans_by_term.setdefault(term_id, []).extend((int(start), int(end - start)))
-        for term, start, end in group["additional_terms"]:
+            flags_by_term.setdefault(term_id, []).append(flag)
+        for term, start, end, flag in group["additional_terms"]:
             term_id = index.term_to_id[("additional", term)]
             spans_by_term.setdefault(term_id, []).extend((int(start), int(end - start)))
+            flags_by_term.setdefault(term_id, []).append(flag)
 
         document_postings = [
             {
                 "doc_id": int(doc_id),
                 "term_id": int(term_id),
                 "positions": np.asarray(flat_positions, dtype=np.int32),
+                "wrapper_flags": list(flags_by_term[term_id]),
             }
             for term_id, flat_positions in sorted(spans_by_term.items())
         ]
@@ -3414,12 +3500,12 @@ def sync_index(
 
         doc_term_keys = {
             ("normal", term)
-            for term, _s, _e in group["normal_terms"]
+            for term, _s, _e, _f in group["normal_terms"]
             if len(term) <= FTS_MAX_CHUNK_LENGTH
         }
         doc_term_keys.update(
             ("additional", term)
-            for term, _s, _e in group["additional_terms"]
+            for term, _s, _e, _f in group["additional_terms"]
             if len(term) <= FTS_MAX_CHUNK_LENGTH
         )
         for key in sorted(doc_term_keys):
@@ -3464,6 +3550,9 @@ def sync_index(
         "physical_files": int(len(desired_path_to_doc)),
     }
 
+# =============================================================================
+# Search execution pipeline
+# =============================================================================
 
 def search_index(
     index: "SearchIndex",
@@ -3815,12 +3904,9 @@ def search_index(
     finally:
         _ACTIVE_DB_QUERY_REPORT.reset(db_report_token)
 
-
-
-
-# -----------------------------------------------------------------------------
-# Document deletion
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Document deletion and path collision handling
+# =============================================================================
 
 def _unique_deleted_destination(deleted_folder: Path, source_path: Path) -> Path:
     """Return a collision-free destination preserving the original filename."""
@@ -3951,74 +4037,12 @@ def delete_document(
         "content_removed": not remaining_locations,
     }
 
-
-# -----------------------------------------------------------------------------
-# Public engine
-
-# -----------------------------------------------------------------------------
-# Public engine
-# -----------------------------------------------------------------------------
-
-def build_runtime_search_caches(
-    docs_table: object,
-    locations_table: object | None = None,
-) -> tuple[dict[int, dict], dict[int, int]]:
-    """Cache unique-content metadata plus every physical source location."""
-    metadata_rows = query_rows(
-        docs_table,
-        columns=["id", "path", "sha256", "word_count"],
-        operation="Runtime unique-document metadata load",
-    )
-    locations_by_doc: dict[int, list[str]] = {}
-    if locations_table is not None:
-        location_rows = query_rows(
-            locations_table,
-            columns=["doc_id", "path"],
-            operation="Runtime document-location load",
-        )
-        for row in location_rows:
-            locations_by_doc.setdefault(int(row["doc_id"]), []).append(
-                str(Path(row["path"]).absolute())
-            )
-
-    document_metadata: dict[int, dict] = {}
-    doc_word_counts: dict[int, int] = {}
-    for row in metadata_rows:
-        doc_id = int(row["id"])
-        locations = sorted(set(locations_by_doc.get(doc_id, [])), key=str.casefold)
-        stored_path = str(row["path"])
-        if not locations and stored_path:
-            locations = [stored_path]
-        document_metadata[doc_id] = {
-            "id": doc_id,
-            "path": locations[0] if locations else stored_path,
-            "sha256": str(row["sha256"]),
-            "locations": locations,
-            "location_count": len(locations),
-        }
-        doc_word_counts[doc_id] = int(row.get("word_count", 0) or 0)
-    return document_metadata, doc_word_counts
-
-
-@dataclass(slots=True)
-class SearchIndex:
-    db: object
-    docs: object
-    locations: object
-    postings: object
-    terms: object
-    frequencies: object
-    fts_docs: object
-    normal_terms_by_length: dict[int, list[str]]
-    additional_terms_by_length: dict[int, list[str]]
-    term_to_id: dict[tuple[str, str], int]
-    id_to_term: dict[int, tuple[str, str]]
-    term_lengths: dict[int, int]
-    doc_word_counts: dict[int, int]
-    document_metadata: dict[int, dict] = field(default_factory=dict)
-    fts_enabled: bool = False
+# =============================================================================
+# Public engine facade
+# =============================================================================
 
 class TextSearchEngine:
+    # Startup, state, and database lifecycle
     def __init__(
         self,
         db_path: str = DB_PATH,
@@ -4033,8 +4057,8 @@ class TextSearchEngine:
         self._folder_snapshot: dict[str, tuple[int, int]] = {}
         _notify_progress(progress_callback, "Opening database", 0.05)
         self.db = lancedb.connect(str(self.db_path))
-        self._maintenance_modifications = self._load_maintenance_modifications()
-        self._startup_count = self._load_startup_count() + 1
+        self._maintenance_modifications, previous_startup_count = self._load_maintenance_state()
+        self._startup_count = previous_startup_count + 1
         self._save_maintenance_modifications()
 
         # Open the persistent tables first, then reconcile source files below.
@@ -4092,7 +4116,6 @@ class TextSearchEngine:
     def _maintenance_state_path(self) -> Path:
         return self.db_path / LANCE_MAINTENANCE_STATE_FILE
 
-
     def _ensure_empty_schema_if_missing(self, progress_callback: ProgressCallback | None) -> None:
         """Create/migrate the schema without discarding legacy source documents.
 
@@ -4134,20 +4157,29 @@ class TextSearchEngine:
         _notify_progress(progress_callback, "Migrating to unique-content index", 0.50)
         rebuild_index(self.db, collect_paths(sources), progress_callback=progress_callback)
 
-    def _load_maintenance_modifications(self) -> int:
+    def _load_maintenance_state(self) -> tuple[int, int]:
+        """Load both maintenance counters from one consistent state-file read."""
         try:
             payload = json.loads(self._maintenance_state_path.read_text(encoding="utf-8"))
-            value = int(payload.get("logical_modifications", 0))
-            return max(0, value)
-        except Exception:
-            return 0
+        except FileNotFoundError:
+            # First launch: a missing state file is expected.
+            return 0, 0
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Could not read LanceDB maintenance state: %s", exc)
+            return 0, 0
 
-    def _load_startup_count(self) -> int:
-        try:
-            payload = json.loads(self._maintenance_state_path.read_text(encoding="utf-8"))
-            return max(0, int(payload.get("startup_count", 0)))
-        except Exception:
-            return 0
+        if not isinstance(payload, dict):
+            logger.warning("Ignoring malformed LanceDB maintenance state: expected an object")
+            return 0, 0
+
+        def read_counter(key: str) -> int:
+            try:
+                return max(0, int(payload.get(key, 0)))
+            except (TypeError, ValueError, OverflowError):
+                logger.warning("Invalid %s value in LanceDB maintenance state", key)
+                return 0
+
+        return read_counter("logical_modifications"), read_counter("startup_count")
 
     def _save_maintenance_modifications(self) -> None:
         state_path = self._maintenance_state_path
@@ -4184,6 +4216,7 @@ class TextSearchEngine:
             )
         )
 
+    # Database maintenance policy
     def _run_database_maintenance(
         self,
         *,
@@ -4207,7 +4240,10 @@ class TextSearchEngine:
             try:
                 should_optimize = should_optimize or int(self.index.docs.count_rows()) == 0
             except Exception:
-                pass
+                logger.warning(
+                    "Could not check whether the document table is empty before maintenance",
+                    exc_info=True,
+                )
 
         optimized = False
         optimize_success = True
@@ -4249,7 +4285,7 @@ class TextSearchEngine:
             "pending_modifications": self._maintenance_modifications,
         }
 
-
+    # Open and activate persisted index state
     def _open_if_valid(
         self,
         *,
@@ -4294,11 +4330,9 @@ class TextSearchEngine:
             fts_enabled=True,
         )
 
-
     @property
     def has_index(self) -> bool:
         return self.index is not None
-
 
     def maintain_storage(
         self,
@@ -4447,7 +4481,7 @@ class TextSearchEngine:
         sources = self._rebuild_sources(extra_paths or [])
         self._rebuild_and_activate(sources, progress_callback=progress_callback)
 
-
+    # Explicit indexing and incremental folder synchronization
     def index_files(
         self,
         paths: list[str | Path],
@@ -4504,7 +4538,6 @@ class TextSearchEngine:
             changed = self._logical_modification_count(result)
             self._record_maintenance_modifications(changed)
             return result
-
 
     def _sync_scanned_folder(
         self,
@@ -4583,6 +4616,7 @@ class TextSearchEngine:
                 progress_callback=progress_callback,
             )
 
+    # Database reset and source-file disposition
     def reset_database(
         self,
         action: Literal["delete", "move"],
@@ -4610,11 +4644,10 @@ class TextSearchEngine:
                 )
                 with debug_path.open("a", encoding="utf-8", buffering=1) as stream:
                     stream.write(line)
-                print(line, end="", flush=True)
-                logger.info(line.rstrip())
+                logger.info("%s", line.rstrip())
             except Exception:
                 # Diagnostics must never be the reason reset fails.
-                pass
+                logger.error("Could not write database-reset diagnostics to %s", debug_path, exc_info=True)
 
         with self._index_lock:
             debug("BEGIN", action=action, db_path=str(self.db_path.absolute()),
@@ -4799,8 +4832,7 @@ class TextSearchEngine:
                 "moved_count": moved_count,
             }
 
-
-
+    # Document metadata and document-level operations
     def count_words_in_file(self, path: str | Path) -> int | None:
         """Return the token count for a readable text file, or ``None`` on failure."""
 
@@ -4882,6 +4914,7 @@ class TextSearchEngine:
                 )
             return result
 
+    # Public search API
     def search_with_report(
         self,
         terms: list[str],
@@ -4958,10 +4991,9 @@ class TextSearchEngine:
         )
         return hits
 
-
-# -----------------------------------------------------------------------------
-# Result formatting
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Result and timing report formatting
+# =============================================================================
 
 def _notepadpp_offset(content: str, char_position: int) -> int:
     """Return the UTF-8 byte offset used by Scintilla/Notepad++ positions.
@@ -5257,6 +5289,9 @@ def format_results(
 
     return "\n".join(lines).rstrip()
 
+# =============================================================================
+# Public exports
+# =============================================================================
 
 __all__ = [
     "DB_PATH",
