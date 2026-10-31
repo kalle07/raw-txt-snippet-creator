@@ -13,9 +13,13 @@ import threading
 import time
 from pathlib import Path
 
+from app_logging import get_app_logger
+
 import wx
 import wx.dataview as dv
 import wx.stc as stc
+
+logger = get_app_logger("gui")
 
 try:
     from watchdog.events import FileSystemEventHandler
@@ -53,7 +57,7 @@ class _SearchFolderEventHandler(FileSystemEventHandler):
 DB_PATH = "text_search.lancedb"
 SEARCH_FOLDER = "txt"
 FUZZY_DISTANCE = 1
-MAX_DISTANCE_CHARS = 200
+MAX_DISTANCE_CHARS = 500
 SNIPPET_CONTEXT_CHARS = 200
 MAX_RESULTS_DEFAULT = "50"  # maximum number of ranked documents
 MAX_RESULTS_PER_DOCUMENT_DEFAULT = "20"  # maximum displayed proximity matches per document
@@ -129,6 +133,47 @@ class SearchProgressRing(wx.Panel):
         gc.StrokePath(path)
 
 
+class ResetDatabaseDialog(wx.Dialog):
+    """Dedicated UI dialog for selecting the database-reset action."""
+
+    def __init__(self, parent: wx.Window) -> None:
+        super().__init__(
+            parent,
+            title="Reset database",
+            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
+        )
+        panel = wx.Panel(self)
+        root = wx.BoxSizer(wx.VERTICAL)
+
+        warning = wx.StaticText(
+            panel,
+            label=(
+                "Choose how to reset the search database.\n\n"
+                "The first two options are destructive and apply to indexed text files "
+                "as well as .txt files currently in the search folder."
+            ),
+        )
+        warning.Wrap(600)
+        root.Add(warning, 0, wx.EXPAND | wx.ALL, 12)
+
+        buttons = wx.BoxSizer(wx.HORIZONTAL)
+        move_btn = wx.Button(panel, label="Reset database, but move files to deleted folder")
+        delete_btn = wx.Button(panel, label="Delete ALL files and RESET database")
+        cancel_btn = wx.Button(panel, label="Cancel")
+        buttons.Add(delete_btn, 0, wx.RIGHT, 8)
+        buttons.Add(move_btn, 0, wx.RIGHT, 8)
+        buttons.Add(cancel_btn, 0)
+        root.Add(buttons, 0, wx.ALIGN_RIGHT | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+
+        delete_btn.Bind(wx.EVT_BUTTON, lambda _e: self.EndModal(wx.ID_YES))
+        move_btn.Bind(wx.EVT_BUTTON, lambda _e: self.EndModal(wx.ID_NO))
+        cancel_btn.Bind(wx.EVT_BUTTON, lambda _e: self.EndModal(wx.ID_CANCEL))
+        self.SetEscapeId(wx.ID_CANCEL)
+        panel.SetSizer(root)
+        self.SetSize((650, 170))
+        self.CentreOnParent()
+
+
 class SearchFrame(wx.Frame):
     def __init__(self) -> None:
         super().__init__(None, title="Text Search", size=(1200, 850))
@@ -141,6 +186,7 @@ class SearchFrame(wx.Frame):
             )
             faulthandler.enable(file=self._faulthandler_stream, all_threads=True)
         except Exception:
+            logger.exception("Could not enable faulthandler")
             self._write_reset_debug("Could not enable faulthandler", traceback.format_exc())
         self._write_reset_debug("GUI STARTED", f"pid={os.getpid()} cwd={Path.cwd()}")
         self.engine = None
@@ -216,6 +262,8 @@ class SearchFrame(wx.Frame):
         if not self.database_loading:
             return
 
+        logger.info("Database load requested (path=%s)", Path(DB_PATH).absolute())
+
         def worker() -> None:
             try:
                 # Lazy import: this is the expensive native/database stack.
@@ -233,6 +281,7 @@ class SearchFrame(wx.Frame):
                     None,
                 )
             except Exception as exc:  # pragma: no cover
+                logger.exception("Database initialization failed")
                 wx.CallAfter(self._on_database_loaded, None, None, exc)
 
         threading.Thread(
@@ -251,6 +300,8 @@ class SearchFrame(wx.Frame):
         self.database_loading = False
 
         if error is not None or engine is None:
+            if error is None:
+                logger.error("Database initialization returned no engine instance")
             self.engine = None
             self._set_database_action_state(False)
             self.search_progress.Reset()
@@ -265,6 +316,7 @@ class SearchFrame(wx.Frame):
 
         self.engine = engine
         self._engine_module = engine_module
+        logger.info("Database loaded successfully; indexed=%s", bool(engine.has_index))
         self._set_database_action_state(True)
 
         # Do not delay the now-responsive GUI while the file list is refreshed.
@@ -1084,6 +1136,7 @@ class SearchFrame(wx.Frame):
         if self._closing:
             return
         if error is not None:
+            logger.error("Tree refresh failed: %s", error, exc_info=(type(error), error, error.__traceback__))
             self._write_reset_debug("TREE REFRESH FAILED", repr(error))
         elif desired_files is not None and desired_dirs is not None:
             self._indexed_source_paths = set(indexed_paths or ())
@@ -1312,6 +1365,7 @@ class SearchFrame(wx.Frame):
                 state = int(self.tree.GetCheckedState(item))
                 self._apply_tree_check_state(item, state)
             except Exception as exc:
+                logger.exception("Folder checkbox propagation failed")
                 self._write_reset_debug("FOLDER CHECK PROPAGATION FAILED", repr(exc))
         event.Skip()
 
@@ -1335,8 +1389,10 @@ class SearchFrame(wx.Frame):
             observer.schedule(handler, str(folder), recursive=True)
             observer.start()
             self._watchdog_observer = observer
+            logger.info("Filesystem monitoring started for %s", folder)
         except Exception as exc:
             self._watchdog_observer = None
+            logger.exception("Filesystem monitoring failed for %s", folder)
             self.SetStatusText(f"Filesystem monitoring failed: {exc}")
             self._write_reset_debug("WATCHDOG START FAILED", repr(exc))
 
@@ -1567,17 +1623,17 @@ class SearchFrame(wx.Frame):
                     daemon=True,
                 ).start()
             except Exception:
-                pass
+                logger.warning("Could not stop filesystem observer cleanly", exc_info=True)
         try:
             faulthandler.disable()
         except Exception:
-            pass
+            logger.warning("Could not disable faulthandler cleanly", exc_info=True)
         if self._faulthandler_stream is not None:
             try:
                 self._faulthandler_stream.flush()
                 self._faulthandler_stream.close()
             except Exception:
-                pass
+                logger.warning("Could not close reset diagnostic stream cleanly", exc_info=True)
         if self._tree_refresh_timer.IsRunning():
             self._tree_refresh_timer.Stop()
         if self._search_progress_timer.IsRunning():
@@ -2152,19 +2208,87 @@ class SearchFrame(wx.Frame):
         )
 
     def _run_background(self, work, on_done) -> None:
+        """Run a GUI operation off-thread and report its result on the UI thread."""
         if self.busy:
+            logger.warning("Ignored background operation while the GUI is busy")
             return
+        operation_name = getattr(work, "__name__", "background operation")
         self._set_busy(True)
         self.SetStatusText("Working ...")
+        logger.info("Background operation started: %s", operation_name)
 
         def worker() -> None:
             try:
                 result = work()
-                wx.CallAfter(on_done, result, None)
             except Exception as exc:  # pragma: no cover
+                logger.exception("Background operation failed: %s", operation_name)
                 wx.CallAfter(on_done, None, exc)
+            else:
+                logger.info("Background operation completed: %s", operation_name)
+                wx.CallAfter(on_done, result, None)
 
-        threading.Thread(target=worker, daemon=True).start()
+        thread = threading.Thread(
+            target=worker,
+            name=f"gui-{operation_name.replace('_', '-')}",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            self._set_busy(False)
+            logger.exception("Could not start background operation: %s", operation_name)
+            on_done(None, exc)
+
+    @staticmethod
+    def _collision_free_destination(destination: Path, source: Path) -> Path:
+        """Avoid overwriting a different file while preserving the old naming rule."""
+        if destination.absolute() == source.absolute() or not destination.exists():
+            return destination
+        stem, suffix = destination.stem, destination.suffix
+        serial = 1
+        while True:
+            candidate = destination.parent / f"{stem} ({serial}){suffix}"
+            if not candidate.exists():
+                return candidate
+            serial += 1
+
+    def _copy_text_files_to_folder(
+        self,
+        sources: list[Path],
+        destination_folder: Path,
+        *,
+        source_root: Path | None = None,
+    ) -> list[Path]:
+        """Copy .txt files into the search folder with consistent collision handling.
+
+        Without ``source_root``, selected external files are flattened by filename
+        and files already inside the search folder are left in place. With a root,
+        its relative folder structure is preserved (the folder-import behavior).
+        """
+        destination_folder = destination_folder.absolute()
+        destination_folder.mkdir(parents=True, exist_ok=True)
+        root = source_root.absolute() if source_root is not None else None
+        copied: list[Path] = []
+
+        for source in sources:
+            source = source.absolute()
+            if source.suffix.casefold() != ".txt":
+                continue
+
+            if root is not None:
+                destination = destination_folder / source.relative_to(root)
+            elif self._inside(source, destination_folder):
+                destination = source
+            else:
+                destination = destination_folder / source.name
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination = self._collision_free_destination(destination, source)
+            if destination.absolute() != source.absolute():
+                shutil.copy2(source, destination)
+            copied.append(destination.absolute())
+
+        return copied
 
     # ------------------------------------------------------------------
     # Buttons
@@ -2187,29 +2311,7 @@ class SearchFrame(wx.Frame):
         folder = Path(SEARCH_FOLDER).absolute()
 
         def copy_files() -> list[Path]:
-            folder.mkdir(parents=True, exist_ok=True)
-            copied: list[Path] = []
-            for source in selected:
-                if source.suffix.casefold() != ".txt":
-                    continue
-                if self._inside(source, folder):
-                    destination = source
-                else:
-                    destination = folder / source.name
-                    # Keep an existing file with the same name intact.
-                    if destination.exists() and destination.absolute() != source.absolute():
-                        stem = destination.stem
-                        suffix = destination.suffix
-                        serial = 1
-                        while True:
-                            candidate = folder / f"{stem} ({serial}){suffix}"
-                            if not candidate.exists():
-                                destination = candidate
-                                break
-                            serial += 1
-                    shutil.copy2(source, destination)
-                copied.append(destination.absolute())
-            return copied
+            return self._copy_text_files_to_folder(selected, folder)
 
         def done(result, error) -> None:
             self._set_busy(False)
@@ -2245,31 +2347,16 @@ class SearchFrame(wx.Frame):
         folder = Path(SEARCH_FOLDER).absolute()
 
         def copy_files() -> list[Path]:
-            folder.mkdir(parents=True, exist_ok=True)
-            copied: list[Path] = []
-            for source in sorted(
-                (p for p in chosen_dir.rglob("*")
-                 if p.is_file() and p.suffix.casefold() == ".txt"),
-                key=lambda p: str(p).casefold(),
-            ):
-                # Preserve sub-folder structure relative to the chosen directory.
-                rel = source.relative_to(chosen_dir)
-                destination = folder / rel
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                # Keep an existing file with the same name intact.
-                if destination.exists() and destination.absolute() != source.absolute():
-                    stem = destination.stem
-                    suffix = destination.suffix
-                    serial = 1
-                    while True:
-                        candidate = destination.parent / f"{stem} ({serial}){suffix}"
-                        if not candidate.exists():
-                            destination = candidate
-                            break
-                        serial += 1
-                shutil.copy2(source, destination)
-                copied.append(destination.absolute())
-            return copied
+            sources = sorted(
+                (path for path in chosen_dir.rglob("*")
+                 if path.is_file() and path.suffix.casefold() == ".txt"),
+                key=lambda path: str(path).casefold(),
+            )
+            return self._copy_text_files_to_folder(
+                sources,
+                folder,
+                source_root=chosen_dir,
+            )
 
         def done(result, error) -> None:
             self._set_busy(False)
@@ -2308,50 +2395,17 @@ class SearchFrame(wx.Frame):
             with self._reset_debug_lock:
                 with self._reset_debug_path.open("a", encoding="utf-8", buffering=1) as stream:
                     stream.write(line + "\n")
-            print(line, flush=True)
+            logger.info("%s", line)
         except Exception:
             # Keep diagnostics best-effort and never disrupt GUI recovery.
-            pass
+            logger.exception("Could not write GUI reset diagnostics")
 
     def _on_reset_database(self, _event: wx.CommandEvent) -> None:
         if self.engine is None:
             return
 
-        class ResetDialog(wx.Dialog):
-            def __init__(self, parent: wx.Window) -> None:
-                super().__init__(parent, title="Reset database", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-                panel = wx.Panel(self)
-                root = wx.BoxSizer(wx.VERTICAL)
 
-                warning = wx.StaticText(
-                    panel,
-                    label=(
-                        "Choose how to reset the search database.\n\n"
-                        "The first two options are destructive and apply to indexed text files "
-                        "as well as .txt files currently in the search folder."
-                    ),
-                )
-                warning.Wrap(600)
-                root.Add(warning, 0, wx.EXPAND | wx.ALL, 12)
-
-                buttons = wx.BoxSizer(wx.HORIZONTAL)
-                move_btn = wx.Button(panel, label="Reset database, but move files to deleted folder")                
-                delete_btn = wx.Button(panel, label="Delete ALL files and RESET database")
-                cancel_btn = wx.Button(panel, label="Cancel")
-                buttons.Add(delete_btn, 0, wx.RIGHT, 8)
-                buttons.Add(move_btn, 0, wx.RIGHT, 8)
-                buttons.Add(cancel_btn, 0)
-                root.Add(buttons, 0, wx.ALIGN_RIGHT | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
-
-                delete_btn.Bind(wx.EVT_BUTTON, lambda _e: self.EndModal(wx.ID_YES))
-                move_btn.Bind(wx.EVT_BUTTON, lambda _e: self.EndModal(wx.ID_NO))
-                cancel_btn.Bind(wx.EVT_BUTTON, lambda _e: self.EndModal(wx.ID_CANCEL))
-                self.SetEscapeId(wx.ID_CANCEL)
-                panel.SetSizer(root)
-                self.SetSize((650, 170))
-                self.CentreOnParent()
-
-        dialog = ResetDialog(self)
+        dialog = ResetDatabaseDialog(self)
         try:
             choice = dialog.ShowModal()
         finally:
@@ -2730,10 +2784,14 @@ class SearchFrame(wx.Frame):
             self._reset_stats()
             self._set_stats_row(self.search_stats, result["stats"])
 
+            # The formatted report contains headers (and optionally timing
+            # details) even when there are no matches. Keep the results field
+            # unambiguous: replace any previous output with exactly one line.
+            has_matches = int(result["stats"].get("matches", 0)) > 0
+
             ui_start = time.perf_counter()
-            self._set_output_text_with_matches(
-                result["text"] or "No proximity matches found."
-            )
+            output_text = result["text"] if has_matches else "No results found."
+            self._set_output_text_with_matches(output_text)
             self.output.SetCurrentPos(0)
             self.output.SetAnchor(0)
             self.output.ScrollToStart()
@@ -2747,7 +2805,7 @@ class SearchFrame(wx.Frame):
             self._update_tree_results()
 
             # The Document Browser now always receives one unified hit list.
-            self._last_search_hits = result.get("hits")
+            self._last_search_hits = result.get("hits") if has_matches else []
             self.btn_document_browser.Enable(bool(self._last_search_hits))
             if self._document_browser is not None:
                 try:
@@ -2761,16 +2819,17 @@ class SearchFrame(wx.Frame):
 
             total_ms = (time.perf_counter() - t_start) * 1000.0
             self._search_timing["total"] = total_ms
-            print("--- SEARCH TIMING BREAKDOWN ---")
-            print(f"Total Time: {total_ms:.2f} ms")
-            print(f"Engine Search: {self._search_timing['search_engine']:.2f} ms")
-            print(f"Format Results: {self._search_timing['format_results']:.2f} ms")
-            print(f"UI Update (SetText/Styling): {self._search_timing['ui_update']:.2f} ms")
-            print(
-                "Other/Overhead: "
-                f"{total_ms - self._search_timing['search_engine'] - self._search_timing['format_results'] - self._search_timing['ui_update']:.2f} ms"
+            logger.info(
+                "Search timing (ms): total=%.2f engine=%.2f format=%.2f ui_update=%.2f overhead=%.2f",
+                total_ms,
+                self._search_timing["search_engine"],
+                self._search_timing["format_results"],
+                self._search_timing["ui_update"],
+                total_ms
+                - self._search_timing["search_engine"]
+                - self._search_timing["format_results"]
+                - self._search_timing["ui_update"],
             )
-            print("---------------------------")
 
         self._run_background(work, done)
 

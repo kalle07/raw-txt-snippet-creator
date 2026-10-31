@@ -276,6 +276,33 @@ class SearchHit:
     chains: list[list[dict]]
     mode: str
     term_modes: list[TermSearchMode] = field(default_factory=list)
+    # One entry per query slot, aligned with ``matches_by_term``. Each item
+    # contains the source span and its exact wrapper annotation (``""`` means
+    # the occurrence was not wrapped).
+    wrapper_annotations: list[list[dict]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class PhraseComponent:
+    """One indexed token component inside a whitespace-containing phrase."""
+
+    query_term: str
+    query_start: int
+    query_end: int
+    required_wrapper: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PhraseSpec:
+    """Indexed phrase components plus exact punctuation/whitespace boundaries."""
+
+    components: tuple[PhraseComponent, ...]
+    gap_patterns: tuple[re.Pattern[str], ...]
+    gap_lengths: tuple[int, ...]
+    prefix_pattern: re.Pattern[str] | None
+    prefix_length: int
+    suffix_pattern: re.Pattern[str] | None
+    suffix_length: int
 
 
 _ACTIVE_DB_QUERY_REPORT: ContextVar["SearchReport | None"] = ContextVar(
@@ -371,6 +398,14 @@ class SearchReport:
 
 
 @dataclass(slots=True)
+class PostingOccurrences:
+    """One document/term posting with occurrence-aligned source annotations."""
+
+    positions: np.ndarray
+    wrapper_flags: np.ndarray
+
+
+@dataclass(slots=True)
 class MatchArrays:
     """Compact in-memory occurrence representation for one query term/doc."""
 
@@ -378,6 +413,27 @@ class MatchArrays:
     ends: np.ndarray
     term_ids: np.ndarray
     edit_distances: np.ndarray
+    wrapper_flags: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=str)
+    )
+    # Optional per-occurrence detail used by composite phrase matches. Ordinary
+    # single-token matches leave this empty and continue using wrapper_flags.
+    component_annotations: list[list[dict]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # Preserve compatibility with callers that still construct the
+        # original four-array shape. Every occurrence receives an explicit
+        # empty annotation in that case.
+        if self.wrapper_flags.size == 0 and self.starts.size:
+            self.wrapper_flags = np.full(self.starts.size, "", dtype=str)
+        elif self.wrapper_flags.size != self.starts.size:
+            raise ValueError(
+                "MatchArrays.wrapper_flags must contain one entry per occurrence."
+            )
+        if self.component_annotations and len(self.component_annotations) != self.starts.size:
+            raise ValueError(
+                "MatchArrays.component_annotations must contain one entry per occurrence."
+            )
 
     @classmethod
     def empty(cls) -> "MatchArrays":
@@ -386,6 +442,7 @@ class MatchArrays:
             ends=np.empty(0, dtype=np.int32),
             term_ids=np.empty(0, dtype=np.int32),
             edit_distances=np.empty(0, dtype=np.int32),
+            wrapper_flags=np.empty(0, dtype=str),
         )
 
     def __len__(self) -> int:
@@ -546,6 +603,371 @@ def _strip_additional_wrapper(token: str) -> str:
     return token[1:-1]
 
 
+def query_wrapper_flag(query_term: str) -> str | None:
+    """Return an explicitly requested wrapper pair, or ``None`` if unrestricted.
+
+    A wrapper is recognized only when it forms one complete configured pair
+    around a non-empty token. This keeps ordinary unwrapped searches
+    unrestricted while allowing queries such as ``\"hello\"`` and ``(hello)``
+    to constrain individual occurrences.
+    """
+    query = normalize_token(query_term.strip())
+    if not _is_wrapped_additional_token(query):
+        return None
+    return query[0] + query[-1]
+
+
+def canonical_query_term(query_term: str) -> str:
+    """Remove one explicitly supplied wrapper without changing token text."""
+    query = query_term.strip()
+    if query_wrapper_flag(query) is None:
+        return query
+    return query[1:-1]
+
+
+def _phrase_boundary_character(char: str) -> bool:
+    """Return True for literal punctuation/symbols outside an indexed token.
+
+    ``*`` and ``?`` retain the search engine's established wildcard meaning,
+    including when they occur at the end of a whitespace-delimited component.
+    """
+    if char in {"*", "?"}:
+        return False
+    category = unicodedata.category(char)
+    return bool(category) and category[0] in {"P", "S"}
+
+
+def _compile_phrase_boundary(text: str) -> tuple[re.Pattern[str] | None, int]:
+    """Compile literal punctuation with each whitespace run matching one whitespace char.
+
+    Phrase adjacency deliberately permits exactly one whitespace character for
+    each whitespace boundary in the query. Punctuation and symbols are literal.
+    The returned length is therefore the exact source span length to probe.
+    """
+    if not text:
+        return None, 0
+    parts: list[str] = []
+    expected_length = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char.isspace():
+            while index < len(text) and text[index].isspace():
+                index += 1
+            parts.append(r"\s")
+            expected_length += 1
+            continue
+        parts.append(re.escape(char))
+        expected_length += 1
+        index += 1
+    try:
+        return re.compile("".join(parts)), expected_length
+    except re.error:  # pragma: no cover - escaped literal pieces are always valid
+        return None, 0
+
+
+def parse_phrase_query(query: str) -> PhraseSpec | None:
+    """Parse a whitespace-containing query into indexed tokens and literal gaps.
+
+    Whitespace-delimited chunks follow the same normal/additional term resolver
+    as ordinary searches. Boundary punctuation is kept in the phrase's literal
+    separators, rather than looked up as a separate vocabulary term.
+    """
+    value = query.strip()
+    if not any(char.isspace() for char in value):
+        return None
+
+    components: list[PhraseComponent] = []
+    for match in re.finditer(r"\S+", value):
+        raw = match.group(0)
+        route = classify_query(raw)
+        left = 0
+        right = len(raw)
+        query_term = raw
+
+        # Keep an already-recognized normal/additional term intact (important
+        # for internal punctuation, regexes, wildcards and wrapped tokens).
+        if route == "fallback":
+            # Preserve the literal-fallback wildcard syntax. The source matcher
+            # already interprets * and ? as bounded non-whitespace wildcards.
+            if "*" not in raw and "?" not in raw:
+                # If the entire chunk is not an indexed token, peel only literal
+                # boundary punctuation/symbols. Those characters remain part
+                # of the separator checked against the indexed source text.
+                while left < right and _phrase_boundary_character(raw[left]):
+                    left += 1
+                while right > left and _phrase_boundary_character(raw[right - 1]):
+                    right -= 1
+                if left >= right:
+                    continue
+                candidate = raw[left:right]
+                route = classify_query(candidate)
+                if route == "fallback":
+                    # Unknown punctuation-bearing chunks remain literal text in
+                    # the gap between the nearest indexed components.
+                    continue
+                query_term = candidate
+
+        wrapper = query_wrapper_flag(query_term)
+        component_start = match.start() + left
+        component_end = match.start() + right
+        if wrapper is not None:
+            component_start += 1
+            component_end -= 1
+        if component_start >= component_end:
+            continue
+        components.append(
+            PhraseComponent(
+                query_term=query_term,
+                query_start=int(component_start),
+                query_end=int(component_end),
+                required_wrapper=wrapper,
+            )
+        )
+
+    # A phrase needs at least two indexed components. A one-token query with
+    # surrounding spaces/punctuation retains the established literal fallback.
+    if len(components) < 2:
+        return None
+
+    gap_patterns: list[re.Pattern[str]] = []
+    gap_lengths: list[int] = []
+    for left_component, right_component in zip(components, components[1:]):
+        separator = value[left_component.query_end:right_component.query_start]
+        pattern, length = _compile_phrase_boundary(separator)
+        if pattern is None or length <= 0:
+            return None
+        gap_patterns.append(pattern)
+        gap_lengths.append(length)
+
+    prefix_pattern, prefix_length = _compile_phrase_boundary(
+        value[:components[0].query_start]
+    )
+    suffix_pattern, suffix_length = _compile_phrase_boundary(
+        value[components[-1].query_end:]
+    )
+    return PhraseSpec(
+        components=tuple(components),
+        gap_patterns=tuple(gap_patterns),
+        gap_lengths=tuple(gap_lengths),
+        prefix_pattern=prefix_pattern,
+        prefix_length=prefix_length,
+        suffix_pattern=suffix_pattern,
+        suffix_length=suffix_length,
+    )
+
+
+def _phrase_edge_matches(
+    content: str,
+    position: int,
+    pattern: re.Pattern[str] | None,
+    length: int,
+    *,
+    before: bool,
+) -> bool:
+    if pattern is None:
+        return True
+    start, end = (position - length, position) if before else (position, position + length)
+    if start < 0 or end > len(content):
+        return False
+    return pattern.fullmatch(content[start:end]) is not None
+
+
+def build_ordered_phrase_matches(
+    phrase: PhraseSpec,
+    component_mappings: Sequence[dict[int, MatchArrays]],
+    source_documents: dict[int, dict],
+    candidate_docs: set[int],
+) -> dict[int, MatchArrays]:
+    """Combine component hits into one occurrence per correctly ordered phrase.
+
+    The rarest component in each candidate document is the anchor. Other
+    components are located at the exact adjacent offsets implied by the query's
+    punctuation and one-whitespace boundary rules. NumPy-sorted occurrence
+    arrays are indexed by start/end coordinates; no Cartesian product is built.
+    """
+    if len(component_mappings) != len(phrase.components) or len(phrase.components) < 2:
+        return {}
+
+    phrase_docs = set(candidate_docs)
+    for mapping in component_mappings:
+        phrase_docs.intersection_update(mapping)
+        if not phrase_docs:
+            return {}
+
+    result: dict[int, MatchArrays] = {}
+    for doc_id in sorted(phrase_docs):
+        document = source_documents.get(int(doc_id))
+        if document is None:
+            continue
+        content = str(document.get("content", ""))
+        component_matches = [mapping[int(doc_id)] for mapping in component_mappings]
+        if any(len(matches) == 0 for matches in component_matches):
+            continue
+
+        # Each mapping is sorted by start/end. Build coordinate lookups once per
+        # component; an end may map to multiple regex/fuzzy candidate spans.
+        starts_by_component: list[dict[int, list[int]]] = []
+        ends_by_component: list[dict[int, list[int]]] = []
+        for matches in component_matches:
+            start_lookup: dict[int, list[int]] = {}
+            end_lookup: dict[int, list[int]] = {}
+            for occurrence_index, (start, end) in enumerate(
+                zip(matches.starts.tolist(), matches.ends.tolist())
+            ):
+                start_lookup.setdefault(int(start), []).append(occurrence_index)
+                end_lookup.setdefault(int(end), []).append(occurrence_index)
+            starts_by_component.append(start_lookup)
+            ends_by_component.append(end_lookup)
+
+        anchor_component = min(
+            range(len(component_matches)),
+            key=lambda index: (len(component_matches[index]), index),
+        )
+        records: dict[tuple[int, ...], tuple[int, int, int, list[dict]]] = {}
+
+        for anchor_occurrence in range(len(component_matches[anchor_component])):
+            states: list[dict[int, int]] = [{anchor_component: anchor_occurrence}]
+
+            # Extend left from the anchor. A predecessor must end exactly one
+            # normalized separator length before the next component starts.
+            for component_index in range(anchor_component - 1, -1, -1):
+                next_matches = component_matches[component_index + 1]
+                current_matches = component_matches[component_index]
+                gap_length = phrase.gap_lengths[component_index]
+                gap_pattern = phrase.gap_patterns[component_index]
+                extended: list[dict[int, int]] = []
+                for state in states:
+                    next_occurrence = state[component_index + 1]
+                    next_start = int(next_matches.starts[next_occurrence])
+                    target_end = next_start - gap_length
+                    for previous_occurrence in ends_by_component[component_index].get(target_end, ()):
+                        previous_end = int(current_matches.ends[previous_occurrence])
+                        if gap_pattern.fullmatch(content[previous_end:next_start]) is None:
+                            continue
+                        new_state = dict(state)
+                        new_state[component_index] = previous_occurrence
+                        extended.append(new_state)
+                states = extended
+                if not states:
+                    break
+
+            if not states:
+                continue
+
+            # Extend right from the anchor (or from the leftmost component once
+            # the left side has been resolved).
+            for component_index in range(anchor_component, len(component_matches) - 1):
+                current_matches = component_matches[component_index]
+                next_matches = component_matches[component_index + 1]
+                gap_length = phrase.gap_lengths[component_index]
+                gap_pattern = phrase.gap_patterns[component_index]
+                extended = []
+                for state in states:
+                    current_occurrence = state[component_index]
+                    current_end = int(current_matches.ends[current_occurrence])
+                    target_start = current_end + gap_length
+                    for next_occurrence in starts_by_component[component_index + 1].get(target_start, ()):
+                        next_start = int(next_matches.starts[next_occurrence])
+                        if gap_pattern.fullmatch(content[current_end:next_start]) is None:
+                            continue
+                        new_state = dict(state)
+                        new_state[component_index + 1] = next_occurrence
+                        extended.append(new_state)
+                states = extended
+                if not states:
+                    break
+
+            for state in states:
+                if len(state) != len(component_matches):
+                    continue
+                first_matches = component_matches[0]
+                last_matches = component_matches[-1]
+                first_occurrence = state[0]
+                last_occurrence = state[len(component_matches) - 1]
+                phrase_start = int(first_matches.starts[first_occurrence])
+                phrase_end = int(last_matches.ends[last_occurrence])
+                if not _phrase_edge_matches(
+                    content,
+                    phrase_start,
+                    phrase.prefix_pattern,
+                    phrase.prefix_length,
+                    before=True,
+                ):
+                    continue
+                if not _phrase_edge_matches(
+                    content,
+                    phrase_end,
+                    phrase.suffix_pattern,
+                    phrase.suffix_length,
+                    before=False,
+                ):
+                    continue
+
+                component_annotations: list[dict] = []
+                total_edit_distance = 0
+                for component_index, component in enumerate(phrase.components):
+                    matches = component_matches[component_index]
+                    occurrence_index = state[component_index]
+                    start = int(matches.starts[occurrence_index])
+                    end = int(matches.ends[occurrence_index])
+                    term_id = int(matches.term_ids[occurrence_index])
+                    edit_distance = int(matches.edit_distances[occurrence_index])
+                    wrapper_flag = str(matches.wrapper_flags[occurrence_index])
+                    total_edit_distance += edit_distance
+                    component_annotations.append(
+                        {
+                            "query_term": component.query_term,
+                            "start": start,
+                            "end": end,
+                            "wrapper_flag": wrapper_flag,
+                            "term_id": term_id,
+                            "edit_distance": edit_distance,
+                        }
+                    )
+
+                # Include explicitly typed punctuation outside the first/last
+                # indexed component in the composite result span. Component
+                # annotations retain the precise token-only offsets.
+                match_start = phrase_start - phrase.prefix_length
+                match_end = phrase_end + phrase.suffix_length
+
+                signature = tuple(
+                    value
+                    for component_index in range(len(component_matches))
+                    for value in (
+                        int(component_matches[component_index].starts[state[component_index]]),
+                        int(component_matches[component_index].ends[state[component_index]]),
+                    )
+                )
+                existing = records.get(signature)
+                if existing is None or total_edit_distance < existing[2]:
+                    records[signature] = (
+                        match_start,
+                        match_end,
+                        total_edit_distance,
+                        component_annotations,
+                    )
+
+        if not records:
+            continue
+
+        ordered_records = sorted(
+            records.values(),
+            key=lambda item: (item[0], item[1], item[2]),
+        )
+        result[int(doc_id)] = MatchArrays(
+            starts=np.asarray([item[0] for item in ordered_records], dtype=np.int32),
+            ends=np.asarray([item[1] for item in ordered_records], dtype=np.int32),
+            term_ids=np.full(len(ordered_records), FALLBACK_TERM_ID, dtype=np.int32),
+            edit_distances=np.asarray([item[2] for item in ordered_records], dtype=np.int32),
+            wrapper_flags=np.full(len(ordered_records), "", dtype=str),
+            component_annotations=[item[3] for item in ordered_records],
+        )
+
+    return result
+
+
 def canonicalize_additional_token(
     token: str,
     *,
@@ -614,15 +1036,17 @@ def find_additional_token_matches(
     content: str,
     query_term: str,
     case_sensitive: bool,
+    required_wrapper: str | None = None,
 ) -> "MatchArrays":
     """Authoritative source fallback using the same wrapper canonicalization."""
     query = canonicalize_additional_token(
-        query_term.strip(),
+        canonical_query_term(query_term),
         strip_trailing_punctuation=False,
     )
     query_norm = query if case_sensitive else query.casefold()
     starts: list[int] = []
     ends: list[int] = []
+    wrapper_flags: list[str] = []
 
     for _normalized, start, end in iter_additional_tokens(content):
         raw_token = content[int(start):int(end)]
@@ -637,9 +1061,15 @@ def find_additional_token_matches(
         if candidate != query_norm:
             continue
 
-        span_start = int(start) + (1 if _is_wrapped_additional_token(raw_core) else 0)
+        wrapped = _is_wrapped_additional_token(raw_core)
+        wrapper_flag = raw_core[0] + raw_core[-1] if wrapped else ""
+        if required_wrapper is not None and wrapper_flag != required_wrapper:
+            continue
+
+        span_start = int(start) + (1 if wrapped else 0)
         starts.append(span_start)
         ends.append(span_start + len(canonical))
+        wrapper_flags.append(wrapper_flag)
 
     if not starts:
         return MatchArrays.empty()
@@ -648,6 +1078,7 @@ def find_additional_token_matches(
         ends=np.asarray(ends, dtype=np.int32),
         term_ids=np.full(len(starts), FALLBACK_TERM_ID, dtype=np.int32),
         edit_distances=np.zeros(len(starts), dtype=np.int32),
+        wrapper_flags=np.asarray(wrapper_flags, dtype=str),
     )
 
 
@@ -724,6 +1155,7 @@ def find_literal_matches(
     content: str,
     query_term: str,
     case_sensitive: bool,
+    required_wrapper: str | None = None,
 ) -> "MatchArrays":
     """Find fallback matches anywhere in source text.
 
@@ -737,7 +1169,12 @@ def find_literal_matches(
     )
     if pattern is None:
         return MatchArrays.empty()
-    matches = list(pattern.finditer(content))
+    matches = [
+        match
+        for match in pattern.finditer(content)
+        if required_wrapper is None
+        or wrapper_flag_for_span(content, match.start(), match.end()) == required_wrapper
+    ]
     if not matches:
         return MatchArrays.empty()
     return MatchArrays(
@@ -746,6 +1183,10 @@ def find_literal_matches(
         # ``-1`` identifies a raw-text/literal match; no vocabulary row exists.
         term_ids=np.full(len(matches), FALLBACK_TERM_ID, dtype=np.int32),
         edit_distances=np.zeros(len(matches), dtype=np.int32),
+        wrapper_flags=np.asarray(
+            [wrapper_flag_for_span(content, match.start(), match.end()) for match in matches],
+            dtype=str,
+        ),
     )
 
 
@@ -783,11 +1224,13 @@ def filter_case_sensitive_matches(
     kept_ends: list[int] = []
     kept_term_ids: list[int] = []
     kept_distances: list[int] = []
-    for start, end, term_id, edit_distance in zip(
+    kept_wrapper_flags: list[str] = []
+    for start, end, term_id, edit_distance, wrapper_flag in zip(
         matches.starts.tolist(),
         matches.ends.tolist(),
         matches.term_ids.tolist(),
         matches.edit_distances.tolist(),
+        matches.wrapper_flags.tolist(),
     ):
         actual = content[int(start):int(end)]
         regex_match = (
@@ -819,6 +1262,7 @@ def filter_case_sensitive_matches(
         kept_ends.append(int(end))
         kept_term_ids.append(int(term_id))
         kept_distances.append(int(edit))
+        kept_wrapper_flags.append(str(wrapper_flag))
 
     if not kept_starts:
         return MatchArrays.empty()
@@ -827,6 +1271,7 @@ def filter_case_sensitive_matches(
         ends=np.asarray(kept_ends, dtype=np.int32),
         term_ids=np.asarray(kept_term_ids, dtype=np.int32),
         edit_distances=np.asarray(kept_distances, dtype=np.int32),
+        wrapper_flags=np.asarray(kept_wrapper_flags, dtype=str),
     )
 
 
@@ -2416,7 +2861,7 @@ def fetch_postings(
     term_ids: set[int],
     candidate_docs: set[int],
     report: SearchReport | None = None,
-) -> dict[int, dict[int, np.ndarray]]:
+) -> dict[int, dict[int, PostingOccurrences]]:
     """
     Fetch positional postings using direct Arrow-to-NumPy conversion.
     
@@ -2426,7 +2871,7 @@ def fetch_postings(
     if not term_ids or not candidate_docs:
         return {}
 
-    grouped: dict[int, dict[int, np.ndarray]] = {}
+    grouped: dict[int, dict[int, PostingOccurrences]] = {}
     candidate_doc_ids = sorted(int(doc_id) for doc_id in candidate_docs)
     stored_term_ids = sorted(int(value) for value in term_ids)
     term_chunk_size = 500
@@ -2443,7 +2888,16 @@ def fetch_postings(
         arrow_table = query_arrow_columns(
             index.postings,
             predicate=full_predicate,
-            columns=["doc_id", "term_id", "positions"],
+            columns=[
+                "doc_id",
+                "term_id",
+                "positions",
+                "wrapper_flags",
+            ] if "wrapper_flags" in index.postings.schema.names else [
+                "doc_id",
+                "term_id",
+                "positions",
+            ],
         )
 
         if arrow_table.num_rows == 0:
@@ -2468,6 +2922,23 @@ def fetch_postings(
         # Extract the underlying buffers directly to NumPy
         flat_values = pos_list_array.values.to_numpy(zero_copy_only=False).astype(np.int32)
         offsets = pos_list_array.offsets.to_numpy(zero_copy_only=False).astype(np.int32)
+
+        # Wrapper flags are stored as one list entry per occurrence, in the
+        # same order as [start, length] pairs in ``positions``. Older database
+        # schemas without this column remain readable; those rows receive
+        # empty annotations and therefore cannot satisfy an explicit wrapper
+        # constraint.
+        if "wrapper_flags" in arrow_table.column_names:
+            flags_chunked = arrow_table.column("wrapper_flags")
+            if isinstance(flags_chunked, pa.ChunkedArray):
+                flags_list_array = pa.concat_arrays(flags_chunked.chunks)
+            else:
+                flags_list_array = flags_chunked
+            flat_flags = flags_list_array.values.to_pylist()
+            flag_offsets = flags_list_array.offsets.to_numpy(zero_copy_only=False).astype(np.int32)
+        else:
+            flat_flags = None
+            flag_offsets = None
         
         # Map each row back to (term_id, doc_id) and slice the flat array
         for i in range(arrow_table.num_rows):
@@ -2480,8 +2951,30 @@ def fetch_postings(
             
             # Slice creates a view (zero-copy), very fast
             positions_arr = flat_values[start_idx:end_idx]
-            
-            grouped.setdefault(term_id, {})[doc_id] = positions_arr
+            occurrence_count = int(positions_arr.size // 2)
+            if flat_flags is not None and flag_offsets is not None:
+                flag_start = int(flag_offsets[i])
+                flag_end = int(flag_offsets[i + 1])
+                flags_arr = np.asarray(
+                    flat_flags[flag_start:flag_end],
+                    dtype=str,
+                )
+            else:
+                flags_arr = np.full(occurrence_count, "", dtype=str)
+
+            # Be defensive with databases created during an interrupted or
+            # older indexing run: maintain one annotation per occurrence.
+            if flags_arr.size != occurrence_count:
+                aligned = np.full(occurrence_count, "", dtype=str)
+                aligned[: min(occurrence_count, flags_arr.size)] = flags_arr[
+                    : min(occurrence_count, flags_arr.size)
+                ]
+                flags_arr = aligned
+
+            grouped.setdefault(term_id, {})[doc_id] = PostingOccurrences(
+                positions=positions_arr,
+                wrapper_flags=flags_arr,
+            )
 
         if report is not None:
             report.runtime_posting_lookups += len(candidate_doc_ids) * len(term_chunk)
@@ -2496,23 +2989,49 @@ def fetch_postings(
 
 def build_match_arrays(
     variants: dict[int, int],
-    postings: dict[int, dict[int, np.ndarray]],
+    postings: dict[int, dict[int, PostingOccurrences]],
+    required_wrapper: str | None = None,
 ) -> dict[int, MatchArrays]:
-    """Merge all accepted indexed variants into one NumPy representation per doc."""
+    """Merge indexed variants, optionally restricting exact occurrence wrappers."""
 
-    chunks: dict[int, list[tuple[np.ndarray, np.ndarray, int, int]]] = {}
+    chunks: dict[
+        int,
+        list[tuple[np.ndarray, np.ndarray, np.ndarray, int, int]],
+    ] = {}
 
     for term_id, edit_distance in variants.items():
-        for doc_id, positions in postings.get(term_id, {}).items():
+        for doc_id, occurrence_data in postings.get(term_id, {}).items():
+            # Accepting the former positions-only shape here keeps this helper
+            # compatible with small external integrations and unit fixtures.
+            if isinstance(occurrence_data, PostingOccurrences):
+                positions = occurrence_data.positions
+                wrapper_flags = occurrence_data.wrapper_flags
+            else:  # pragma: no cover - compatibility path
+                positions = np.asarray(occurrence_data, dtype=np.int32)
+                wrapper_flags = np.full(positions.size // 2, "", dtype=str)
             if positions.size == 0:
                 continue
             starts = positions[0::2]
             lengths = positions[1::2]
             ends = starts + lengths
+            if wrapper_flags.size != starts.size:
+                aligned = np.full(starts.size, "", dtype=str)
+                aligned[: min(starts.size, wrapper_flags.size)] = wrapper_flags[
+                    : min(starts.size, wrapper_flags.size)
+                ]
+                wrapper_flags = aligned
+            if required_wrapper is not None:
+                occurrence_mask = wrapper_flags == required_wrapper
+                if not np.any(occurrence_mask):
+                    continue
+                starts = starts[occurrence_mask]
+                ends = ends[occurrence_mask]
+                wrapper_flags = wrapper_flags[occurrence_mask]
             chunks.setdefault(doc_id, []).append(
                 (
                     np.asarray(starts, dtype=np.int32),
                     np.asarray(ends, dtype=np.int32),
+                    np.asarray(wrapper_flags, dtype=str),
                     int(term_id),
                     int(edit_distance),
                 )
@@ -2526,12 +3045,13 @@ def build_match_arrays(
 
         starts = np.concatenate([piece[0] for piece in pieces]).astype(np.int32, copy=False)
         ends = np.concatenate([piece[1] for piece in pieces]).astype(np.int32, copy=False)
+        wrapper_flags = np.concatenate([piece[2] for piece in pieces]).astype(str, copy=False)
         term_ids = np.concatenate(
-            [np.full(piece[0].size, piece[2], dtype=np.int32) for piece in pieces]
+            [np.full(piece[0].size, piece[3], dtype=np.int32) for piece in pieces]
         )
         edit_distances = np.concatenate(
             [
-                np.full(piece[0].size, piece[3], dtype=np.int32)
+                np.full(piece[0].size, piece[4], dtype=np.int32)
                 for piece in pieces
             ]
         )
@@ -2542,6 +3062,7 @@ def build_match_arrays(
         order = np.lexsort((term_ids, edit_distances, ends, starts))
         starts = starts[order]
         ends = ends[order]
+        wrapper_flags = wrapper_flags[order]
         term_ids = term_ids[order]
         edit_distances = edit_distances[order]
 
@@ -2555,6 +3076,7 @@ def build_match_arrays(
             ends=ends[keep],
             term_ids=term_ids[keep],
             edit_distances=edit_distances[keep],
+            wrapper_flags=wrapper_flags[keep],
         )
 
     return result
@@ -2569,24 +3091,55 @@ def build_matches_for_document(
     if len(matches) == 0:
         return []
 
-    query_len = len(query_term.strip().casefold())
+    query_len = len(canonical_query_term(query_term).casefold())
     output: list[dict] = []
-    for start, end, term_id, edit_distance in zip(
+    for occurrence_index, (start, end, term_id, edit_distance, wrapper_flag) in enumerate(zip(
         matches.starts.tolist(),
         matches.ends.tolist(),
         matches.term_ids.tolist(),
         matches.edit_distances.tolist(),
-    ):
+        matches.wrapper_flags.tolist(),
+    )):
         if int(term_id) < 0:
-            indexed_term = query_term.strip()
+            indexed_term = canonical_query_term(query_term)
         else:
             indexed_term = id_to_term[int(term_id)][1]
-        max_len = max(query_len, len(indexed_term))
-        score = (
-            100.0
-            if int(term_id) < 0 or mode == "regex" or max_len == 0
-            else 100.0 * (1.0 - int(edit_distance) / max_len)
+        component_annotations = (
+            matches.component_annotations[occurrence_index]
+            if matches.component_annotations
+            else []
         )
+        if component_annotations:
+            component_scores: list[float] = []
+            indexed_components: list[str] = []
+            for annotation in component_annotations:
+                component_query = str(annotation.get("query_term", ""))
+                component_term_id = int(annotation.get("term_id", FALLBACK_TERM_ID))
+                component_edit = int(annotation.get("edit_distance", 0))
+                component_indexed = (
+                    canonical_query_term(component_query)
+                    if component_term_id < 0
+                    else id_to_term[component_term_id][1]
+                )
+                component_length = max(
+                    len(canonical_query_term(component_query).casefold()),
+                    len(component_indexed),
+                )
+                component_scores.append(
+                    100.0
+                    if component_term_id < 0 or mode == "regex" or component_length == 0
+                    else 100.0 * (1.0 - component_edit / component_length)
+                )
+                indexed_components.append(component_indexed)
+            score = sum(component_scores) / len(component_scores)
+            indexed_term = " ".join(indexed_components)
+        else:
+            max_len = max(query_len, len(indexed_term))
+            score = (
+                100.0
+                if int(term_id) < 0 or mode == "regex" or max_len == 0
+                else 100.0 * (1.0 - int(edit_distance) / max_len)
+            )
         output.append(
             {
                 "start": int(start),
@@ -2596,6 +3149,8 @@ def build_matches_for_document(
                 "query_term": query_term,
                 "indexed_term": indexed_term,
                 "term_id": int(term_id),
+                "wrapper_flag": str(wrapper_flag),
+                "component_annotations": component_annotations,
             }
         )
     return output
@@ -2646,6 +3201,8 @@ def find_proximity_chains_numpy(
     term_code_parts: list[np.ndarray] = []
     indexed_term_parts: list[np.ndarray] = []
     edit_parts: list[np.ndarray] = []
+    wrapper_parts: list[np.ndarray] = []
+    component_annotation_parts: list[list[list[dict]]] = []
 
     for query_term, matches, sensitive in zip(query_terms, matches_by_term, case_flags):
         code = term_code[(query_term.casefold(), bool(sensitive))]
@@ -2658,6 +3215,11 @@ def find_proximity_chains_numpy(
         )
         indexed_term_parts.append(matches.term_ids)
         edit_parts.append(matches.edit_distances)
+        wrapper_parts.append(matches.wrapper_flags)
+        if matches.component_annotations:
+            component_annotation_parts.extend(matches.component_annotations)
+        else:
+            component_annotation_parts.extend([[] for _ in range(len(matches))])
 
     if not starts_parts:
         return []
@@ -2667,6 +3229,8 @@ def find_proximity_chains_numpy(
     codes = np.concatenate(term_code_parts).astype(np.int16, copy=False)
     indexed_term_ids = np.concatenate(indexed_term_parts).astype(np.int32, copy=False)
     edit_distances = np.concatenate(edit_parts).astype(np.int32, copy=False)
+    wrapper_flags = np.concatenate(wrapper_parts).astype(str, copy=False)
+    component_annotations = component_annotation_parts
 
     # Sort by position, then normalized query code. Duplicate query slots for
     # the same normalized keyword are intentionally adjacent and deduplicated.
@@ -2676,6 +3240,8 @@ def find_proximity_chains_numpy(
     codes = codes[order]
     indexed_term_ids = indexed_term_ids[order]
     edit_distances = edit_distances[order]
+    wrapper_flags = wrapper_flags[order]
+    component_annotations = [component_annotations[int(index)] for index in order.tolist()]
 
     keep = np.ones(starts.size, dtype=bool)
     if starts.size > 1:
@@ -2690,6 +3256,12 @@ def find_proximity_chains_numpy(
     codes = codes[keep]
     indexed_term_ids = indexed_term_ids[keep]
     edit_distances = edit_distances[keep]
+    wrapper_flags = wrapper_flags[keep]
+    component_annotations = [
+        annotation
+        for annotation, keep_value in zip(component_annotations, keep.tolist())
+        if keep_value
+    ]
 
     if starts.size == 0:
         return []
@@ -2764,26 +3336,59 @@ def find_proximity_chains_numpy(
         chain_codes = codes[component_start : absolute_end + 1]
         chain_term_ids = indexed_term_ids[component_start : absolute_end + 1]
         chain_edits = edit_distances[component_start : absolute_end + 1]
+        chain_wrappers = wrapper_flags[component_start : absolute_end + 1]
 
         chain: list[dict] = []
-        for start, end, code, term_id, edit_distance in zip(
+        for local_index, (start, end, code, term_id, edit_distance, wrapper_flag) in enumerate(zip(
             chain_starts.tolist(),
             chain_ends.tolist(),
             chain_codes.tolist(),
             chain_term_ids.tolist(),
             chain_edits.tolist(),
-        ):
+            chain_wrappers.tolist(),
+        )):
             query_term = display_terms[unique_terms[int(code)]]
             if int(term_id) < 0:
-                indexed_term = query_term.strip()
+                indexed_term = canonical_query_term(query_term)
             else:
                 indexed_term = id_to_term[int(term_id)][1]
-            max_len = max(len(query_term.strip().casefold()), len(indexed_term))
-            score = (
-                100.0
-                if int(term_id) < 0 or max_len == 0
-                else 100.0 * (1.0 - int(edit_distance) / max_len)
-            )
+            occurrence_annotations = component_annotations[
+                component_start + local_index
+            ]
+            if occurrence_annotations:
+                component_scores: list[float] = []
+                indexed_components: list[str] = []
+                for annotation in occurrence_annotations:
+                    component_query = str(annotation.get("query_term", ""))
+                    component_term_id = int(annotation.get("term_id", FALLBACK_TERM_ID))
+                    component_edit = int(annotation.get("edit_distance", 0))
+                    component_indexed = (
+                        canonical_query_term(component_query)
+                        if component_term_id < 0
+                        else id_to_term[component_term_id][1]
+                    )
+                    component_length = max(
+                        len(canonical_query_term(component_query).casefold()),
+                        len(component_indexed),
+                    )
+                    component_scores.append(
+                        100.0
+                        if component_term_id < 0 or component_length == 0
+                        else 100.0 * (1.0 - component_edit / component_length)
+                    )
+                    indexed_components.append(component_indexed)
+                score = sum(component_scores) / len(component_scores)
+                indexed_term = " ".join(indexed_components)
+            else:
+                max_len = max(
+                    len(canonical_query_term(query_term).casefold()),
+                    len(indexed_term),
+                )
+                score = (
+                    100.0
+                    if int(term_id) < 0 or max_len == 0
+                    else 100.0 * (1.0 - int(edit_distance) / max_len)
+                )
             chain.append(
                 {
                     "start": int(start),
@@ -2793,6 +3398,8 @@ def find_proximity_chains_numpy(
                     "query_term": query_term,
                     "indexed_term": indexed_term,
                     "term_id": int(term_id),
+                    "wrapper_flag": str(wrapper_flag),
+                    "component_annotations": occurrence_annotations,
                 }
             )
 
@@ -2890,6 +3497,32 @@ def build_snippet(content: str, chain: list[dict], context_chars: int) -> str:
     prefix = "\n..." if snippet_start else ""
     suffix = "...\n" if snippet_end < len(content) else ""
     return prefix + snippet + suffix
+
+
+def fetch_indexed_document_contents(
+    index: "SearchIndex",
+    doc_ids: Sequence[int],
+) -> dict[int, dict]:
+    """Fetch indexed text snapshots for phrase verification.
+
+    Positional offsets refer to the indexed snapshot, not to a potentially
+    modified source file. Reading DOCS.content also avoids reopening every
+    candidate file during phrase searches; final result documents still use the
+    normal hash-verified ``fetch_documents`` path.
+    """
+    if not doc_ids:
+        return {}
+    rows = query_rows_in(
+        index.docs,
+        "id",
+        sorted(int(doc_id) for doc_id in doc_ids),
+        ["id", "content"],
+        operation="Phrase source-text lookup",
+    )
+    return {
+        int(row["id"]): {"content": str(row.get("content", "") or "")}
+        for row in rows
+    }
 
 
 def fetch_documents(
@@ -3579,25 +4212,63 @@ def search_index(
             report.total_ms = (time.perf_counter() - started_total) * 1000.0
             return [], report
 
-        # 1. Python term resolver is authoritative for query variants.
+        # Expand each whitespace-containing GUI keyword into indexed phrase
+        # components. Single-token keyword slots retain the original code path.
+        phrase_specs: list[PhraseSpec | None] = []
+        slot_component_indices: list[list[int]] = []
+        flat_query_terms: list[str] = []
+        flat_case_flags: list[bool] = []
+        flat_term_modes: list[TermSearchMode] = []
+        flat_required_wrappers: list[str | None] = []
+        flat_canonical_terms: list[str] = []
+
+        for slot, query_term in enumerate(query_terms):
+            phrase_spec = parse_phrase_query(query_term)
+            if phrase_spec is not None:
+                phrase_specs.append(phrase_spec)
+                components = phrase_spec.components
+            else:
+                phrase_specs.append(None)
+                components = (
+                    PhraseComponent(
+                        query_term=query_term,
+                        query_start=0,
+                        query_end=len(query_term),
+                        required_wrapper=query_wrapper_flag(query_term),
+                    ),
+                )
+
+            component_indices: list[int] = []
+            for component in components:
+                component_indices.append(len(flat_query_terms))
+                flat_query_terms.append(component.query_term)
+                flat_case_flags.append(case_flags[slot])
+                flat_term_modes.append(term_modes[slot])
+                flat_required_wrappers.append(component.required_wrapper)
+                flat_canonical_terms.append(canonical_query_term(component.query_term))
+            slot_component_indices.append(component_indices)
+
+        # 1. Resolve each indexed component using the existing normal/additional
+        # vocabulary paths. Literal punctuation stays in PhraseSpec separators.
         _notify_progress(progress_callback, "Variant resolution", 0.10)
-        variants_by_term, routes, fallback_flags = resolve_query_terms(
+        variants_by_component, routes, fallback_flags = resolve_query_terms(
             index,
-            query_terms,
+            flat_query_terms,
             mode,
             config,
             report,
-            term_modes=term_modes,
+            term_modes=flat_term_modes,
         )
 
-        # 2. Tantivy performs exact candidate lookup only. Fuzzy/regex/wildcard
-        # semantics have already been resolved in Python against one term type.
+        # 2. Candidate documents must contain every indexed component across
+        # every keyword slot. Punctuation-only phrase separators are verified
+        # later from the stored source text and do not need vocabulary entries.
         _notify_progress(progress_callback, "Candidate lookup", 0.20)
         candidate_docs = fts_candidate_docs(
             index,
-            query_terms,
+            flat_query_terms,
             routes,
-            variants_by_term,
+            variants_by_component,
             fallback_flags,
             report,
         )
@@ -3612,14 +4283,13 @@ def search_index(
             _notify_progress(progress_callback, "No results found", 1.0)
             return [], report
 
-        # 3. Frequency planning uses the authoritative frequency table only for
-        # resolved indexed terms. Fallback terms remain in the final match
-        # intersection and do not get approximated.
+        # 3. Use per-component frequencies to discard documents missing an
+        # indexed phrase component and retain the rarest-token anchor plan.
         _notify_progress(progress_callback, "Frequency planning", 0.30)
         indexed_terms: list[str] = []
         indexed_variants: list[dict[int, int]] = []
         for query_term, variants, fallback in zip(
-            query_terms, variants_by_term, fallback_flags
+            flat_query_terms, variants_by_component, fallback_flags
         ):
             if variants and not fallback:
                 indexed_terms.append(query_term)
@@ -3665,8 +4335,7 @@ def search_index(
             _notify_progress(progress_callback, "No results found", 1.0)
             return [], report
 
-        # 4. Unified positional postings. Both normal and additional variants
-        # are addressed by the same (doc_id, term_id) lookup.
+        # 4. Fetch all required postings once for all flattened components.
         required_term_ids = {
             int(term_id)
             for variants in indexed_variants
@@ -3684,38 +4353,50 @@ def search_index(
         report.postings_rows = sum(len(doc_map) for doc_map in postings.values())
         _notify_progress(progress_callback, "Match building", 0.55)
 
-        needs_source_content = any(fallback_flags) or any(case_flags)
+        needs_source_content = (
+            any(fallback_flags)
+            or any(flat_case_flags)
+            or any(spec is not None for spec in phrase_specs)
+        )
         source_documents: dict[int, dict] = {}
         if needs_source_content:
-            source_documents = fetch_documents(
-                index,
-                sorted(candidate_docs),
-                report,
-            )
+            if any(spec is not None for spec in phrase_specs):
+                source_documents = fetch_indexed_document_contents(
+                    index,
+                    sorted(candidate_docs),
+                )
+            else:
+                source_documents = fetch_documents(
+                    index,
+                    sorted(candidate_docs),
+                    report,
+                )
 
-        # 5. Build compact NumPy match arrays for every query slot.
+        # 5. Build each flattened component's occurrence array.
         match_build_started = time.perf_counter()
-        match_arrays_by_term: list[dict[int, MatchArrays]] = []
-
-        for slot, (
+        component_mappings: list[dict[int, MatchArrays]] = []
+        for component_index, (
             query_term,
             route,
             variants,
             fallback,
             case_sensitive,
             term_mode,
+            required_wrapper,
+            canonical_term,
         ) in enumerate(
             zip(
-                query_terms,
+                flat_query_terms,
                 routes,
-                variants_by_term,
+                variants_by_component,
                 fallback_flags,
-                case_flags,
-                term_modes,
+                flat_case_flags,
+                flat_term_modes,
+                flat_required_wrappers,
+                flat_canonical_terms,
             )
         ):
             started = time.perf_counter()
-
             if fallback or not variants:
                 mapping: dict[int, MatchArrays] = {}
                 for doc_id in candidate_docs:
@@ -3723,25 +4404,30 @@ def search_index(
                     if document is None:
                         continue
                     content = str(document.get("content", ""))
-                    if route == "additional":
+                    if route == "additional" or required_wrapper is not None:
                         matches = find_additional_token_matches(
                             content,
-                            query_term,
+                            canonical_term,
                             case_sensitive,
+                            required_wrapper=required_wrapper,
                         )
                     else:
                         matches = find_literal_matches(
                             content,
                             query_term,
                             case_sensitive,
+                            required_wrapper=required_wrapper,
                         )
                     if len(matches):
                         mapping[int(doc_id)] = matches
                 path_used = "literal fallback"
             else:
-                mapping = build_match_arrays(variants, postings)
+                mapping = build_match_arrays(
+                    variants,
+                    postings,
+                    required_wrapper=required_wrapper,
+                )
                 path_used = "terms/postings"
-
                 if case_sensitive:
                     filtered_mapping: dict[int, MatchArrays] = {}
                     for doc_id, matches in mapping.items():
@@ -3751,15 +4437,16 @@ def search_index(
                         filtered = filter_case_sensitive_matches(
                             matches,
                             str(document.get("content", "")),
-                            query_term,
+                            canonical_term,
                             term_mode,
                             config.fuzzy_distance,
                         )
                         if len(filtered):
-                            filtered_mapping[int(doc_id)] = filtered
+                            filtered_mapping[doc_id] = filtered
                     mapping = filtered_mapping
 
-            match_arrays_by_term.append(mapping)
+            component_mappings.append(mapping)
+            elapsed = (time.perf_counter() - started) * 1000.0
             report.match_build_by_term.append(
                 {
                     "query_term": query_term,
@@ -3771,18 +4458,50 @@ def search_index(
                     "path": path_used,
                     "route": route,
                     "matching_docs": len(mapping),
-                    "occurrences": sum(
-                        len(items) for items in mapping.values()
-                    ),
-                    "time_ms": (time.perf_counter() - started) * 1000.0,
+                    "occurrences": sum(len(items) for items in mapping.values()),
+                    "time_ms": elapsed,
                 }
             )
+
+        # 6. Recombine each phrase's token arrays into one logical MatchArrays
+        # slot. This preserves GUI keyword-row semantics and ensures the normal
+        # proximity engine sees one span for the complete phrase.
+        match_arrays_by_term: list[dict[int, MatchArrays]] = []
+        for slot, (query_term, component_indices, phrase_spec) in enumerate(
+            zip(query_terms, slot_component_indices, phrase_specs)
+        ):
+            if phrase_spec is None:
+                mapping = component_mappings[component_indices[0]]
+            else:
+                phrase_started = time.perf_counter()
+                phrase_component_mappings = [
+                    component_mappings[index] for index in component_indices
+                ]
+                mapping = build_ordered_phrase_matches(
+                    phrase_spec,
+                    phrase_component_mappings,
+                    source_documents,
+                    candidate_docs,
+                )
+                report.match_build_by_term.append(
+                    {
+                        "query_term": query_term,
+                        "term_type": "phrase",
+                        "path": "indexed ordered phrase (rarest-component anchor)",
+                        "route": "phrase",
+                        "matching_docs": len(mapping),
+                        "occurrences": sum(len(items) for items in mapping.values()),
+                        "time_ms": (time.perf_counter() - phrase_started) * 1000.0,
+                    }
+                )
+            match_arrays_by_term.append(mapping)
 
         report.match_build_ms = (
             time.perf_counter() - match_build_started
         ) * 1000.0
 
-        # 6. This is the authoritative document intersection.
+        # 7. Authoritative document intersection at the original GUI keyword
+        # slot level: a phrase counts as one keyword, not N separate keywords.
         intersection_started = time.perf_counter()
         for mapping in match_arrays_by_term:
             candidate_docs.intersection_update(mapping)
@@ -3799,7 +4518,7 @@ def search_index(
             _notify_progress(progress_callback, "No results found", 1.0)
             return [], report
 
-        # 7. Existing NumPy positional/proximity engine remains authoritative.
+        # 8. Existing NumPy proximity engine works on original keyword slots.
         hit_chains: dict[int, list[list[dict]]] = {}
         hit_scores: dict[int, tuple[int, int, int]] = {}
         max_results_per_document = config.effective_max_results_per_document
@@ -3811,7 +4530,16 @@ def search_index(
             ]
             doc_started = time.perf_counter()
             anchor_info = anchors.get(doc_id)
-            anchor_term = anchor_info["query_term"] if anchor_info else None
+            # The posting-level anchor may be an inner phrase component. The
+            # composite phrase slot is therefore allowed to select its own
+            # rarest occurrence anchor inside find_proximity_chains_numpy.
+            anchor_term = (
+                anchor_info["query_term"]
+                if anchor_info and anchor_info["query_term"] in {
+                    query_term.casefold() for query_term in query_terms
+                }
+                else None
+            )
             chains = find_proximity_chains_numpy(
                 per_term,
                 query_terms,
@@ -3843,8 +4571,6 @@ def search_index(
             (*hit_scores[doc_id], doc_id)
             for doc_id in hit_chains
         ]
-        # Higher maximum chain length ranks first. Total chain length and the
-        # total number of chains are deterministic tie-breakers.
         scored_hits.sort(
             key=lambda item: (-item[0], -item[1], -item[2], item[3])
         )
@@ -3876,6 +4602,32 @@ def search_index(
                     term_modes,
                 )
             ]
+            public_wrapper_annotations: list[list[dict]] = []
+            for term_matches in public_matches:
+                slot_annotations: list[dict] = []
+                for match in term_matches:
+                    component_annotations = match.get("component_annotations") or []
+                    if component_annotations:
+                        for annotation in component_annotations:
+                            slot_annotations.append(
+                                {
+                                    "query_term": str(annotation.get("query_term", match.get("query_term", ""))),
+                                    "start": int(annotation.get("start", 0)),
+                                    "end": int(annotation.get("end", 0)),
+                                    "wrapper_flag": str(annotation.get("wrapper_flag", "")),
+                                }
+                            )
+                    else:
+                        slot_annotations.append(
+                            {
+                                "query_term": str(match.get("query_term", "")),
+                                "start": int(match["start"]),
+                                "end": int(match["end"]),
+                                "wrapper_flag": str(match.get("wrapper_flag", "")),
+                            }
+                        )
+                public_wrapper_annotations.append(slot_annotations)
+
             hits.append(
                 SearchHit(
                     doc_id=doc_id,
@@ -3884,6 +4636,7 @@ def search_index(
                     chains=hit_chains[doc_id],
                     mode=overall_mode,
                     term_modes=list(term_modes),
+                    wrapper_annotations=public_wrapper_annotations,
                 )
             )
 
@@ -3891,9 +4644,7 @@ def search_index(
             time.perf_counter() - result_started
         ) * 1000.0
         report.final_documents = len(hits)
-        report.total_ms = (
-            time.perf_counter() - started_total
-        ) * 1000.0
+        report.total_ms = (time.perf_counter() - started_total) * 1000.0
 
         if not hits:
             report.diagnostics.append("no results found")
@@ -5252,8 +6003,22 @@ def format_results(
 
         for term_matches in hit.matches_by_term:
             query_term = term_matches[0]["query_term"] if term_matches else ""
+            wrapper_counts: dict[str, int] = {}
+            for occurrence in term_matches:
+                component_annotations = occurrence.get("component_annotations") or []
+                annotations = component_annotations or [occurrence]
+                for annotation in annotations:
+                    component_query = str(annotation.get("query_term", query_term))
+                    wrapper = str(annotation.get("wrapper_flag", ""))
+                    label = f"{component_query}: {'unwrapped' if not wrapper else repr(wrapper)}"
+                    wrapper_counts[label] = wrapper_counts.get(label, 0) + 1
+            wrapper_summary = ", ".join(
+                f"{label}: {count}"
+                for label, count in sorted(wrapper_counts.items())
+            )
             lines.append(
                 f"  - '{query_term}': {format_occurrence_count(len(term_matches))} occurrence(s)"
+                + (f" [wrappers: {wrapper_summary}]" if wrapper_summary else "")
             )
 
         lines.append("MATCHES:")
@@ -5275,6 +6040,18 @@ def format_results(
                 "  Query terms: " + ", ".join(m["query_term"] for m in ordered),
                 "  Matched text: "
                 + ", ".join(content[m["start"] : m["end"]] for m in ordered),
+                "  Wrapper annotations: "
+                + ", ".join(
+                    annotation_text
+                    for m in ordered
+                    for annotation_text in (
+                        [
+                            f"{item.get('query_term', m['query_term'])}="
+                            + ("unwrapped" if not item.get("wrapper_flag", "") else repr(str(item.get("wrapper_flag", ""))))
+                            for item in (m.get("component_annotations") or [m])
+                        ]
+                    )
+                ),
                 "  Snippet: " + build_snippet(content, ordered, snippet_context_chars),
             ]
             if hit.mode in {"fuzzy", "both", "mixed"}:
@@ -5311,6 +6088,10 @@ __all__ = [
     "FTS_MAX_CHUNK_LENGTH",
     "SEARCH_DEBUG_LOG",
     "SearchConfig",
+    "PhraseComponent",
+    "PhraseSpec",
+    "parse_phrase_query",
+    "build_ordered_phrase_matches",
     "SearchMode",
     "TermSearchMode",
     "SearchHit",

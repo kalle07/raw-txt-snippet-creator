@@ -34,6 +34,7 @@ class BrowserDocument:
     chains: list[list[dict[str, Any]]]
     occurrence_ranges: list[tuple[int, int]]
     metadata: dict[str, Any] = field(default_factory=dict)
+    wrapper_annotations: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def result_count(self) -> int:
@@ -453,6 +454,20 @@ class DocumentBrowserFrame(wx.Frame):
             8,
         )
 
+        self.wrapper_label = wx.StaticText(
+            parent,
+            label="Wrappers: —",
+        )
+        self.wrapper_label.SetToolTip(
+            "Wrapper punctuation recorded for the active result occurrences."
+        )
+        navigation_row.Add(
+            self.wrapper_label,
+            1,
+            wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
+            8,
+        )
+
         self.btn_previous = wx.Button(
             parent,
             label="◀",
@@ -734,6 +749,18 @@ class DocumentBrowserFrame(wx.Frame):
 
         if not document.chains:
             lines.append("(No chains found.)")
+            lines.extend(["", "All occurrence wrapper annotations:"])
+            if document.wrapper_annotations:
+                for annotation in document.wrapper_annotations:
+                    wrapper = str(annotation.get("wrapper_flag", ""))
+                    wrapper_label = "unwrapped" if not wrapper else repr(wrapper)
+                    lines.append(
+                        f"  {annotation.get('query_term', '')}: {wrapper_label} "
+                        f"at characters {annotation.get('start', 0)}-"
+                        f"{annotation.get('end', 0)}"
+                    )
+            else:
+                lines.append("  (No wrapper annotations available.)")
             return "\n".join(lines) + "\n"
 
         for chain_number, chain in enumerate(document.chains, start=1):
@@ -768,7 +795,32 @@ class DocumentBrowserFrame(wx.Frame):
                 f"Chain {chain_number} [start={chain_start}, end={chain_end}]: "
                 f"{display_text}\n\n---"
             )
+            occurrence_details = []
+            for item in chain:
+                component_annotations = item.get("component_annotations") or []
+                annotations = component_annotations or [item]
+                for annotation in annotations:
+                    query_term = str(annotation.get("query_term") or item.get("query_term", ""))
+                    wrapper = str(annotation.get("wrapper_flag", ""))
+                    wrapper_label = "unwrapped" if not wrapper else repr(wrapper)
+                    occurrence_details.append(
+                        f"{query_term} [wrapper: {wrapper_label}]"
+                    )
+            lines.append("  Matched occurrences: " + ", ".join(occurrence_details))
             lines.append("")
+
+        lines.extend(["", "All occurrence wrapper annotations:"])
+        if document.wrapper_annotations:
+            for annotation in document.wrapper_annotations:
+                wrapper = str(annotation.get("wrapper_flag", ""))
+                wrapper_label = "unwrapped" if not wrapper else repr(wrapper)
+                lines.append(
+                    f"  {annotation.get('query_term', '')}: {wrapper_label} "
+                    f"at characters {annotation.get('start', 0)}-"
+                    f"{annotation.get('end', 0)}"
+                )
+        else:
+            lines.append("  (No wrapper annotations available.)")
 
         return "\n".join(lines).rstrip() + "\n"
 
@@ -880,6 +932,7 @@ class DocumentBrowserFrame(wx.Frame):
                     content=content,
                     chains=[],
                     occurrence_ranges=[],
+                    wrapper_annotations=[],
                     metadata={
                         str(key): value
                         for key, value in source_document.items()
@@ -893,6 +946,25 @@ class DocumentBrowserFrame(wx.Frame):
             browser_document.chains.extend(
                 getattr(hit, "chains", []) or []
             )
+
+            hit_matches = getattr(hit, "matches_by_term", []) or []
+            hit_wrapper_annotations = getattr(hit, "wrapper_annotations", []) or []
+            for slot, annotations in enumerate(hit_wrapper_annotations):
+                term_matches = hit_matches[slot] if slot < len(hit_matches) else []
+                query_term = (
+                    str(term_matches[0].get("query_term", ""))
+                    if term_matches
+                    else ""
+                )
+                for annotation in annotations or []:
+                    browser_document.wrapper_annotations.append(
+                        {
+                            "query_term": str(annotation.get("query_term") or query_term),
+                            "start": int(annotation.get("start", 0)),
+                            "end": int(annotation.get("end", 0)),
+                            "wrapper_flag": str(annotation.get("wrapper_flag", "")),
+                        }
+                    )
 
             for term_matches in getattr(
                 hit,
@@ -1435,6 +1507,28 @@ class DocumentBrowserFrame(wx.Frame):
         )
 
         self.result_number.SetValue(str(shown))
+
+        wrapper_text = "Wrappers: —"
+        wrapper_tooltip = "No active result wrapper annotations."
+        if document is not None and 0 <= self._result_index < count:
+            chain = document.chains[self._result_index]
+            annotation_labels = []
+            for item in chain:
+                component_annotations = item.get("component_annotations") or []
+                annotations = component_annotations or [item]
+                for annotation in annotations:
+                    query_term = str(annotation.get("query_term") or item.get("query_term", ""))
+                    wrapper = str(annotation.get("wrapper_flag", ""))
+                    wrapper_label = "unwrapped" if not wrapper else repr(wrapper)
+                    annotation_labels.append(f"{query_term}: {wrapper_label}")
+            if annotation_labels:
+                wrapper_tooltip = "\n".join(annotation_labels)
+                visible = annotation_labels[:3]
+                if len(annotation_labels) > len(visible):
+                    visible.append(f"+{len(annotation_labels) - len(visible)} more")
+                wrapper_text = "Wrappers: " + "; ".join(visible)
+        self.wrapper_label.SetLabel(wrapper_text)
+        self.wrapper_label.SetToolTip(wrapper_tooltip)
 
         navigation_enabled = count > 0
 
