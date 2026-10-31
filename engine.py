@@ -63,6 +63,7 @@ import shutil
 import threading
 import time
 import traceback
+from bisect import bisect_left
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from collections.abc import Mapping
@@ -144,7 +145,7 @@ TermType = Literal["normal", "additional"]
 
 TermKey = tuple[str, str]
 
-QueryRoute = Literal["normal", "additional", "fallback"]
+QueryRoute = Literal["normal", "additional", "fallback", "wildcard"]
 
 FALLBACK_TERM_ID = -1
 
@@ -284,12 +285,15 @@ class SearchHit:
 
 @dataclass(frozen=True, slots=True)
 class PhraseComponent:
-    """One indexed token component inside a whitespace-containing phrase."""
+    """One token or positional-wildcard component in a phrase."""
 
     query_term: str
     query_start: int
     query_end: int
     required_wrapper: str | None = None
+    # A component made exclusively from * and ? is resolved directly against
+    # source token positions. It must never be expanded into vocabulary terms.
+    wildcard_pattern: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +333,9 @@ class SearchReport:
     variant_candidate_term_ids: int = 0
     variant_candidate_min_length: int | None = None
     variant_candidate_max_length: int | None = None
+    wildcard_candidate_terms_examined: int = 0
+    wildcard_candidate_terms_matched: int = 0
+    wildcard_candidate_lookup_ms: float = 0.0
     variant_resolution: list[dict] = field(default_factory=list)
     tantivy_ms: float = 0.0
     tantivy_by_term: list[dict] = field(default_factory=list)
@@ -466,6 +473,10 @@ class SearchIndex:
     doc_word_counts: dict[int, int]
     document_metadata: dict[int, dict] = field(default_factory=dict)
     fts_enabled: bool = False
+    # Lazily built only when a suffix-only wildcard query needs it. These
+    # per-length sorted reversed terms allow suffix constraints to use bisect
+    # without adding load-time cost or changing the persistent schema.
+    normal_terms_by_reversed_length: dict[int, list[str]] = field(default_factory=dict)
 
 # =============================================================================
 # Tokenization and query normalization
@@ -667,7 +678,7 @@ def _compile_phrase_boundary(text: str) -> tuple[re.Pattern[str] | None, int]:
 
 
 def parse_phrase_query(query: str) -> PhraseSpec | None:
-    """Parse a whitespace-containing query into indexed tokens and literal gaps.
+    """Parse a whitespace-containing query into tokens, wildcards and gaps.
 
     Whitespace-delimited chunks follow the same normal/additional term resolver
     as ordinary searches. Boundary punctuation is kept in the phrase's literal
@@ -680,35 +691,39 @@ def parse_phrase_query(query: str) -> PhraseSpec | None:
     components: list[PhraseComponent] = []
     for match in re.finditer(r"\S+", value):
         raw = match.group(0)
-        route = classify_query(raw)
         left = 0
         right = len(raw)
         query_term = raw
+        wildcard_pattern = raw if re.fullmatch(r"[*?]+", raw) else None
 
-        # Keep an already-recognized normal/additional term intact (important
-        # for internal punctuation, regexes, wildcards and wrapped tokens).
-        if route == "fallback":
-            # Preserve the literal-fallback wildcard syntax. The source matcher
-            # already interprets * and ? as bounded non-whitespace wildcards.
-            if "*" not in raw and "?" not in raw:
+        # A standalone run of wildcard operators is a positional component,
+        # not a vocabulary query. Embedded patterns such as ``plag*`` remain
+        # ordinary indexed wildcard terms and are optimized by the resolver.
+        if wildcard_pattern is None:
+            route = classify_query(raw)
+            # Keep an already-recognized normal/additional term intact
+            # (important for internal punctuation, embedded wildcards, regexes
+            # and wrapped tokens).
+            if route == "fallback":
                 # If the entire chunk is not an indexed token, peel only literal
                 # boundary punctuation/symbols. Those characters remain part
                 # of the separator checked against the indexed source text.
-                while left < right and _phrase_boundary_character(raw[left]):
-                    left += 1
-                while right > left and _phrase_boundary_character(raw[right - 1]):
-                    right -= 1
-                if left >= right:
-                    continue
-                candidate = raw[left:right]
-                route = classify_query(candidate)
-                if route == "fallback":
-                    # Unknown punctuation-bearing chunks remain literal text in
-                    # the gap between the nearest indexed components.
-                    continue
-                query_term = candidate
+                if "*" not in raw and "?" not in raw:
+                    while left < right and _phrase_boundary_character(raw[left]):
+                        left += 1
+                    while right > left and _phrase_boundary_character(raw[right - 1]):
+                        right -= 1
+                    if left >= right:
+                        continue
+                    candidate = raw[left:right]
+                    route = classify_query(candidate)
+                    if route == "fallback":
+                        # Unknown punctuation-bearing chunks remain literal text
+                        # in the gap between the nearest indexed components.
+                        continue
+                    query_term = candidate
 
-        wrapper = query_wrapper_flag(query_term)
+        wrapper = query_wrapper_flag(query_term) if wildcard_pattern is None else None
         component_start = match.start() + left
         component_end = match.start() + right
         if wrapper is not None:
@@ -722,12 +737,15 @@ def parse_phrase_query(query: str) -> PhraseSpec | None:
                 query_start=int(component_start),
                 query_end=int(component_end),
                 required_wrapper=wrapper,
+                wildcard_pattern=wildcard_pattern,
             )
         )
 
-    # A phrase needs at least two indexed components. A one-token query with
-    # surrounding spaces/punctuation retains the established literal fallback.
-    if len(components) < 2:
+    # A phrase needs at least two components and at least one real indexed
+    # anchor. A wildcard-only phrase retains the source-scan fallback.
+    if len(components) < 2 or not any(
+        component.wildcard_pattern is None for component in components
+    ):
         return None
 
     gap_patterns: list[re.Pattern[str]] = []
@@ -773,24 +791,91 @@ def _phrase_edge_matches(
     return pattern.fullmatch(content[start:end]) is not None
 
 
+def _positional_wildcard_token_matches(pattern: str, token: str) -> bool:
+    """Match a complete normal word against a standalone * / ? component.
+
+    Every ``?`` consumes exactly one character and every ``*`` consumes at
+    least one. The complete token is capped at 100 characters, matching the
+    established literal-fallback wildcard limit.
+    """
+    if len(token) > FTS_MAX_CHUNK_LENGTH or len(token) < len(pattern):
+        return False
+    if "*" not in pattern:
+        return len(token) == len(pattern)
+    return True
+
+
+def _wildcard_word_starting_at(
+    content: str,
+    start: int,
+    pattern: str,
+) -> tuple[int, int] | None:
+    """Return the normal-token span beginning at ``start`` if it fits pattern."""
+    if start < 0 or start >= len(content):
+        return None
+    match = TOKEN_PATTERN.match(content, start)
+    if match is None or match.start() != start:
+        return None
+    token = match.group(0)
+    if not _positional_wildcard_token_matches(pattern, token):
+        return None
+    return int(match.start()), int(match.end())
+
+
+def _wildcard_word_ending_at(
+    content: str,
+    end: int,
+    pattern: str,
+) -> tuple[int, int] | None:
+    """Return the normal-token span ending at ``end`` without scanning a doc.
+
+    At most ``FTS_MAX_CHUNK_LENGTH + 1`` characters are inspected. A longer
+    token is rejected as soon as the configured wildcard bound is exceeded.
+    """
+    if end <= 0 or end > len(content):
+        return None
+    start = end
+    while start > 0 and _WORD_CHAR_RE.fullmatch(content[start - 1]):
+        start -= 1
+        if end - start > FTS_MAX_CHUNK_LENGTH:
+            return None
+    if start == end:
+        return None
+    token = content[start:end]
+    if not _positional_wildcard_token_matches(pattern, token):
+        return None
+    return int(start), int(end)
+
+
 def build_ordered_phrase_matches(
     phrase: PhraseSpec,
-    component_mappings: Sequence[dict[int, MatchArrays]],
+    component_mappings: Sequence[dict[int, MatchArrays] | None],
     source_documents: dict[int, dict],
     candidate_docs: set[int],
 ) -> dict[int, MatchArrays]:
-    """Combine component hits into one occurrence per correctly ordered phrase.
+    """Combine indexed tokens and anchor-checked wildcard words into phrase hits.
 
-    The rarest component in each candidate document is the anchor. Other
-    components are located at the exact adjacent offsets implied by the query's
-    punctuation and one-whitespace boundary rules. NumPy-sorted occurrence
-    arrays are indexed by start/end coordinates; no Cartesian product is built.
+    Standalone ``*`` / ``?`` components deliberately have no MatchArrays and
+    are never expanded into vocabulary terms or every word occurrence in a
+    document. The rarest non-wildcard component is selected as the anchor.
+    Wildcard words are then checked directly at the exact source offset while
+    extending left/right from that anchor.
     """
     if len(component_mappings) != len(phrase.components) or len(phrase.components) < 2:
         return {}
 
+    indexed_component_indices = [
+        i for i, component in enumerate(phrase.components)
+        if component.wildcard_pattern is None
+    ]
+    if not indexed_component_indices:
+        return {}
+
     phrase_docs = set(candidate_docs)
-    for mapping in component_mappings:
+    for component_index in indexed_component_indices:
+        mapping = component_mappings[component_index]
+        if mapping is None:
+            return {}
         phrase_docs.intersection_update(mapping)
         if not phrase_docs:
             return {}
@@ -801,47 +886,124 @@ def build_ordered_phrase_matches(
         if document is None:
             continue
         content = str(document.get("content", ""))
-        component_matches = [mapping[int(doc_id)] for mapping in component_mappings]
-        if any(len(matches) == 0 for matches in component_matches):
+        component_matches: list[MatchArrays | None] = []
+        missing_component = False
+        for component_index in range(len(phrase.components)):
+            mapping = component_mappings[component_index]
+            if mapping is None:
+                component_matches.append(None)
+                continue
+            matches = mapping.get(int(doc_id))
+            if matches is None or len(matches) == 0:
+                missing_component = True
+                break
+            component_matches.append(matches)
+        if missing_component:
             continue
 
-        # Each mapping is sorted by start/end. Build coordinate lookups once per
-        # component; an end may map to multiple regex/fuzzy candidate spans.
-        starts_by_component: list[dict[int, list[int]]] = []
-        ends_by_component: list[dict[int, list[int]]] = []
-        for matches in component_matches:
-            start_lookup: dict[int, list[int]] = {}
-            end_lookup: dict[int, list[int]] = {}
-            for occurrence_index, (start, end) in enumerate(
-                zip(matches.starts.tolist(), matches.ends.tolist())
-            ):
-                start_lookup.setdefault(int(start), []).append(occurrence_index)
-                end_lookup.setdefault(int(end), []).append(occurrence_index)
-            starts_by_component.append(start_lookup)
-            ends_by_component.append(end_lookup)
+        # Coordinate lookups use sorted NumPy arrays + searchsorted instead
+        # of Python dictionaries. Starts and ends are prepared only for real
+        # indexed components; wildcard positions are inspected lazily below.
+        start_lookup_by_component: list[tuple[np.ndarray, np.ndarray] | None] = [
+            None for _ in phrase.components
+        ]
+        end_lookup_by_component: list[tuple[np.ndarray, np.ndarray] | None] = [
+            None for _ in phrase.components
+        ]
+        for component_index in indexed_component_indices:
+            matches = component_matches[component_index]
+            assert matches is not None
+            start_order = np.argsort(matches.starts, kind="stable").astype(
+                np.int32, copy=False
+            )
+            end_order = np.argsort(matches.ends, kind="stable").astype(
+                np.int32, copy=False
+            )
+            start_lookup_by_component[component_index] = (
+                matches.starts[start_order], start_order
+            )
+            end_lookup_by_component[component_index] = (
+                matches.ends[end_order], end_order
+            )
+
+        def occurrences_at_coordinate(
+            component_index: int,
+            *,
+            use_end: bool,
+            coordinate: int,
+        ) -> np.ndarray:
+            lookup = (
+                end_lookup_by_component[component_index]
+                if use_end
+                else start_lookup_by_component[component_index]
+            )
+            assert lookup is not None
+            sorted_coordinates, order = lookup
+            left = int(np.searchsorted(sorted_coordinates, coordinate, side="left"))
+            right = int(np.searchsorted(sorted_coordinates, coordinate, side="right"))
+            return order[left:right]
 
         anchor_component = min(
-            range(len(component_matches)),
+            indexed_component_indices,
             key=lambda index: (len(component_matches[index]), index),
         )
+        # Indexed components store occurrence indices; positional wildcard
+        # components store their one verified (start, end) pair.
         records: dict[tuple[int, ...], tuple[int, int, int, list[dict]]] = {}
 
-        for anchor_occurrence in range(len(component_matches[anchor_component])):
-            states: list[dict[int, int]] = [{anchor_component: anchor_occurrence}]
+        def occurrence_span(
+            component_index: int,
+            state: dict[int, int | tuple[int, int]],
+        ) -> tuple[int, int]:
+            value = state[component_index]
+            if phrase.components[component_index].wildcard_pattern is not None:
+                return value  # type: ignore[return-value]
+            matches = component_matches[component_index]
+            assert matches is not None
+            occurrence_index = int(value)  # type: ignore[arg-type]
+            return (
+                int(matches.starts[occurrence_index]),
+                int(matches.ends[occurrence_index]),
+            )
 
-            # Extend left from the anchor. A predecessor must end exactly one
-            # normalized separator length before the next component starts.
+        for anchor_occurrence in range(len(component_matches[anchor_component])):  # type: ignore[arg-type]
+            states: list[dict[int, int | tuple[int, int]]] = [
+                {anchor_component: anchor_occurrence}
+            ]
+
+            # Extend left from the anchor. For a wildcard predecessor, derive
+            # its token end from the next component and inspect only that word.
             for component_index in range(anchor_component - 1, -1, -1):
-                next_matches = component_matches[component_index + 1]
-                current_matches = component_matches[component_index]
+                extended: list[dict[int, int | tuple[int, int]]] = []
                 gap_length = phrase.gap_lengths[component_index]
                 gap_pattern = phrase.gap_patterns[component_index]
-                extended: list[dict[int, int]] = []
                 for state in states:
-                    next_occurrence = state[component_index + 1]
-                    next_start = int(next_matches.starts[next_occurrence])
+                    next_start, _next_end = occurrence_span(component_index + 1, state)
                     target_end = next_start - gap_length
-                    for previous_occurrence in ends_by_component[component_index].get(target_end, ()):
+                    if gap_pattern.fullmatch(content[target_end:next_start]) is None:
+                        continue
+
+                    wildcard_pattern = phrase.components[component_index].wildcard_pattern
+                    if wildcard_pattern is not None:
+                        span = _wildcard_word_ending_at(
+                            content,
+                            target_end,
+                            wildcard_pattern,
+                        )
+                        if span is None:
+                            continue
+                        new_state = dict(state)
+                        new_state[component_index] = span
+                        extended.append(new_state)
+                        continue
+
+                    current_matches = component_matches[component_index]
+                    assert current_matches is not None
+                    for previous_occurrence in occurrences_at_coordinate(
+                        component_index,
+                        use_end=True,
+                        coordinate=target_end,
+                    ):
                         previous_end = int(current_matches.ends[previous_occurrence])
                         if gap_pattern.fullmatch(content[previous_end:next_start]) is None:
                             continue
@@ -855,19 +1017,39 @@ def build_ordered_phrase_matches(
             if not states:
                 continue
 
-            # Extend right from the anchor (or from the leftmost component once
-            # the left side has been resolved).
-            for component_index in range(anchor_component, len(component_matches) - 1):
-                current_matches = component_matches[component_index]
-                next_matches = component_matches[component_index + 1]
+            # Extend right. Wildcard components are checked at their one
+            # expected start offset; indexed components use their sorted map.
+            for component_index in range(anchor_component, len(phrase.components) - 1):
+                extended = []
                 gap_length = phrase.gap_lengths[component_index]
                 gap_pattern = phrase.gap_patterns[component_index]
-                extended = []
+                wildcard_pattern = phrase.components[component_index + 1].wildcard_pattern
                 for state in states:
-                    current_occurrence = state[component_index]
-                    current_end = int(current_matches.ends[current_occurrence])
+                    current_start, current_end = occurrence_span(component_index, state)
                     target_start = current_end + gap_length
-                    for next_occurrence in starts_by_component[component_index + 1].get(target_start, ()):
+                    if gap_pattern.fullmatch(content[current_end:target_start]) is None:
+                        continue
+
+                    if wildcard_pattern is not None:
+                        span = _wildcard_word_starting_at(
+                            content,
+                            target_start,
+                            wildcard_pattern,
+                        )
+                        if span is None:
+                            continue
+                        new_state = dict(state)
+                        new_state[component_index + 1] = span
+                        extended.append(new_state)
+                        continue
+
+                    next_matches = component_matches[component_index + 1]
+                    assert next_matches is not None
+                    for next_occurrence in occurrences_at_coordinate(
+                        component_index + 1,
+                        use_end=False,
+                        coordinate=target_start,
+                    ):
                         next_start = int(next_matches.starts[next_occurrence])
                         if gap_pattern.fullmatch(content[current_end:next_start]) is None:
                             continue
@@ -879,17 +1061,13 @@ def build_ordered_phrase_matches(
                     break
 
             for state in states:
-                if len(state) != len(component_matches):
+                if len(state) != len(phrase.components):
                     continue
-                first_matches = component_matches[0]
-                last_matches = component_matches[-1]
-                first_occurrence = state[0]
-                last_occurrence = state[len(component_matches) - 1]
-                phrase_start = int(first_matches.starts[first_occurrence])
-                phrase_end = int(last_matches.ends[last_occurrence])
+                first_start, _first_end = occurrence_span(0, state)
+                _last_start, last_end = occurrence_span(len(phrase.components) - 1, state)
                 if not _phrase_edge_matches(
                     content,
-                    phrase_start,
+                    first_start,
                     phrase.prefix_pattern,
                     phrase.prefix_length,
                     before=True,
@@ -897,7 +1075,7 @@ def build_ordered_phrase_matches(
                     continue
                 if not _phrase_edge_matches(
                     content,
-                    phrase_end,
+                    last_end,
                     phrase.suffix_pattern,
                     phrase.suffix_length,
                     before=False,
@@ -907,13 +1085,18 @@ def build_ordered_phrase_matches(
                 component_annotations: list[dict] = []
                 total_edit_distance = 0
                 for component_index, component in enumerate(phrase.components):
+                    start, end = occurrence_span(component_index, state)
                     matches = component_matches[component_index]
-                    occurrence_index = state[component_index]
-                    start = int(matches.starts[occurrence_index])
-                    end = int(matches.ends[occurrence_index])
-                    term_id = int(matches.term_ids[occurrence_index])
-                    edit_distance = int(matches.edit_distances[occurrence_index])
-                    wrapper_flag = str(matches.wrapper_flags[occurrence_index])
+                    if component.wildcard_pattern is not None:
+                        term_id = FALLBACK_TERM_ID
+                        edit_distance = 0
+                        wrapper_flag = wrapper_flag_for_span(content, start, end)
+                    else:
+                        assert matches is not None
+                        value = int(state[component_index])  # type: ignore[arg-type]
+                        term_id = int(matches.term_ids[value])
+                        edit_distance = int(matches.edit_distances[value])
+                        wrapper_flag = str(matches.wrapper_flags[value])
                     total_edit_distance += edit_distance
                     component_annotations.append(
                         {
@@ -926,19 +1109,12 @@ def build_ordered_phrase_matches(
                         }
                     )
 
-                # Include explicitly typed punctuation outside the first/last
-                # indexed component in the composite result span. Component
-                # annotations retain the precise token-only offsets.
-                match_start = phrase_start - phrase.prefix_length
-                match_end = phrase_end + phrase.suffix_length
-
+                match_start = first_start - phrase.prefix_length
+                match_end = last_end + phrase.suffix_length
                 signature = tuple(
                     value
-                    for component_index in range(len(component_matches))
-                    for value in (
-                        int(component_matches[component_index].starts[state[component_index]]),
-                        int(component_matches[component_index].ends[state[component_index]]),
-                    )
+                    for component_index in range(len(phrase.components))
+                    for value in occurrence_span(component_index, state)
                 )
                 existing = records.get(signature)
                 if existing is None or total_edit_distance < existing[2]:
@@ -992,13 +1168,19 @@ def classify_query(term: str) -> QueryRoute:
     if not query:
         return "fallback"
 
-    # Ordinary closing punctuation stays a literal fallback query. A complete
-    # configured wrapper pair takes precedence over regex metacharacters such
-    # as [] and {}. Wrapped plain words route through the normal-term index
-    # (their wrapper is recorded per occurrence in postings); other wrapped
-    # tokens route through the additional-term index.
+    # Ordinary closing punctuation stays a literal fallback query. A trailing
+    # question mark is the documented one-character wildcard when the complete
+    # query otherwise has valid wildcard syntax. A complete configured wrapper
+    # pair takes precedence over regex metacharacters such as [] and {}.
+    # Wrapped plain words route through the normal-term index (their wrapper is
+    # recorded per occurrence in postings); other wrapped tokens use additional.
     if query.rstrip(_ADDITIONAL_TRAILING_PUNCTUATION) != query:
-        return "fallback"
+        trailing_question_wildcard = (
+            query.endswith("?")
+            and re.fullmatch(r"[\w*?^$+|{}\[\]\\.\-]+", query, flags=re.UNICODE)
+        )
+        if not trailing_question_wildcard:
+            return "fallback"
     if _is_wrapped_additional_token(query):
         if _STANDARD_TOKEN_RE.fullmatch(query[1:-1]):
             return "normal"
@@ -2204,6 +2386,7 @@ def remove_unused_terms(index: "SearchIndex", affected_term_ids: set[int]) -> se
         surviving.update(int(row["term_id"]) for row in rows)
 
     obsolete = affected_term_ids - surviving
+    removed_normal_terms = False
     if obsolete:
         delete_rows_in(index.terms, "term_id", sorted(obsolete))
         for term_id in obsolete:
@@ -2213,6 +2396,8 @@ def remove_unused_terms(index: "SearchIndex", affected_term_ids: set[int]) -> se
                 continue
             index.term_to_id.pop(key, None)
             term_type, term = key
+            if term_type == "normal":
+                removed_normal_terms = True
             target = (
                 index.normal_terms_by_length
                 if term_type == "normal"
@@ -2227,6 +2412,11 @@ def remove_unused_terms(index: "SearchIndex", affected_term_ids: set[int]) -> se
                 if not values:
                     target.pop(len(term), None)
             index.term_lengths.pop(int(term_id), None)
+        if removed_normal_terms:
+            # The lazy suffix buckets contain a reversed copy of the normal
+            # vocabulary. Keep them coherent after sync/deletion as well as
+            # after insertions.
+            index.normal_terms_by_reversed_length.clear()
     return obsolete
 
 
@@ -2381,6 +2571,7 @@ def fts_candidate_docs(
         term_type = (
             "additional" if route == "additional"
             else "fallback" if route == "fallback"
+            else "wildcard" if route == "wildcard"
             else "normal"
         )
         entry = {
@@ -2394,6 +2585,17 @@ def fts_candidate_docs(
             "query_text": None,
             "time_ms": 0.0,
         }
+
+        # A standalone * / ? phrase component is checked positionally between
+        # indexed anchors. It must neither expand vocabulary terms nor widen
+        # the candidate pool to every document.
+        if route == "wildcard":
+            entry["status"] = "positional"
+            entry["path"] = "anchor-driven source-position wildcard"
+            entry["time_ms"] = (time.perf_counter() - started) * 1000.0
+            report.tantivy_by_term.append(entry)
+            report.tantivy_ms += entry["time_ms"]
+            continue
 
         try:
             if fallback or not variants:
@@ -2472,8 +2674,13 @@ def fts_candidate_docs(
             report.candidate_docs_before_positions = 0
             return set()
 
-    report.candidate_docs_before_positions = len(candidate_docs or set())
-    return candidate_docs or set()
+    # If the complete query contains only positional wildcard components,
+    # there is no indexed anchor and a source scan of all document IDs is
+    # unavoidable. Mixed queries retain the candidate intersection above.
+    if candidate_docs is None:
+        candidate_docs = all_document_ids(index)
+    report.candidate_docs_before_positions = len(candidate_docs)
+    return candidate_docs
 
 # =============================================================================
 # Vocabulary resolution and search planning
@@ -2556,6 +2763,108 @@ def compile_wildcard(
         return None
 
 
+def _terms_with_prefix(bucket: list[str], prefix: str):
+    """Yield one sorted length bucket's contiguous prefix range using bisect."""
+    position = bisect_left(bucket, prefix)
+    while position < len(bucket):
+        term = bucket[position]
+        if not term.startswith(prefix):
+            break
+        yield term
+        position += 1
+
+
+def _reversed_normal_terms_by_length(index: "SearchIndex") -> dict[int, list[str]]:
+    """Build the suffix lookup lazily, avoiding database-open/load-time cost."""
+    if not index.normal_terms_by_reversed_length:
+        index.normal_terms_by_reversed_length = {
+            token_length: sorted(term[::-1] for term in terms)
+            for token_length, terms in index.normal_terms_by_length.items()
+        }
+    return index.normal_terms_by_reversed_length
+
+
+def resolve_wildcard_variants(
+    index: "SearchIndex",
+    query: str,
+) -> dict[int, int]:
+    """Resolve embedded * / ? patterns without scanning the whole vocabulary.
+
+    Candidate term lengths are bounded first. A literal prefix or suffix then
+    selects a contiguous range from the corresponding sorted vocabulary
+    bucket; the compiled wildcard regex is applied only to that reduced set.
+    The function preserves the existing regex-mode semantics and returns the
+    same ``term_id -> edit_distance`` mapping as ``resolve_variants``.
+    """
+    normalized = query.casefold()
+    first_wildcard = min(
+        (position for position, char in enumerate(normalized) if char in "*?"),
+        default=len(normalized),
+    )
+    last_wildcard = max(
+        (position for position, char in enumerate(normalized) if char in "*?"),
+        default=-1,
+    )
+    prefix = normalized[:first_wildcard]
+    suffix = normalized[last_wildcard + 1:]
+    minimum_length = len(normalized)  # * consumes at least one, ? exactly one.
+    maximum_length = max(index.normal_terms_by_length, default=0)
+    pattern = compile_wildcard(normalized)
+    if pattern is None or minimum_length > maximum_length:
+        return {}
+
+    report = _ACTIVE_DB_QUERY_REPORT.get()
+    started = time.perf_counter()
+    use_reversed = bool(suffix) and (
+        not prefix or len(suffix) > len(prefix)
+    )
+    reversed_buckets = (
+        _reversed_normal_terms_by_length(index) if use_reversed else {}
+    )
+
+    examined = 0
+    result: dict[int, int] = {}
+
+    for token_length in range(minimum_length, maximum_length + 1):
+        original_bucket = index.normal_terms_by_length.get(token_length, ())
+        if not original_bucket:
+            continue
+
+        if use_reversed:
+            reversed_bucket = reversed_buckets.get(token_length, ())
+            reverse_prefix = suffix[::-1]
+            candidates = (
+                reversed_term[::-1]
+                for reversed_term in _terms_with_prefix(
+                    reversed_bucket,
+                    reverse_prefix,
+                )
+            )
+        elif prefix:
+            candidates = _terms_with_prefix(original_bucket, prefix)
+        else:
+            candidates = iter(original_bucket)
+
+        for term in candidates:
+            examined += 1
+            if prefix and not term.startswith(prefix):
+                continue
+            if suffix and not term.endswith(suffix):
+                continue
+            if pattern.fullmatch(term) is None:
+                continue
+            term_id = index.term_to_id.get(("normal", term))
+            if term_id is not None:
+                result[int(term_id)] = 0
+
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if report is not None:
+        report.wildcard_candidate_terms_examined += examined
+        report.wildcard_candidate_terms_matched += len(result)
+        report.wildcard_candidate_lookup_ms += elapsed_ms
+    return result
+
+
 def resolve_variants(
     index: "SearchIndex",
     query_term: str,
@@ -2610,6 +2919,15 @@ def resolve_variants(
         ):
             term_id = index.term_to_id.get(("normal", normalized))
             return {int(term_id): 0} if term_id is not None else {}
+
+        # Embedded character wildcards use length + fixed-prefix/suffix
+        # candidate selection. Arbitrary regex syntax retains the full
+        # vocabulary scan because no safe lexical bounds can be inferred.
+        if (
+            ("*" in normalized or "?" in normalized)
+            and not _has_regex_syntax_except_wildcards(normalized)
+        ):
+            return resolve_wildcard_variants(index, normalized)
 
         pattern = (
             compile_wildcard(query)
@@ -2710,6 +3028,7 @@ def resolve_query_terms(
     config: SearchConfig,
     report: SearchReport,
     term_modes: Sequence[TermSearchMode] | None = None,
+    positional_wildcards: Sequence[bool] | None = None,
 ) -> tuple[list[dict[int, int]], list[QueryRoute], list[bool]]:
     variants_by_term: list[dict[int, int]] = []
     routes: list[QueryRoute] = []
@@ -2719,10 +3038,38 @@ def resolve_query_terms(
         len(query_terms),
         mode,
     )
+    wildcard_flags = (
+        [bool(value) for value in positional_wildcards]
+        if positional_wildcards is not None
+        else [False] * len(query_terms)
+    )
+    if len(wildcard_flags) < len(query_terms):
+        wildcard_flags.extend([False] * (len(query_terms) - len(wildcard_flags)))
+    wildcard_flags = wildcard_flags[:len(query_terms)]
 
     started_total = time.perf_counter()
-    for query_term, term_mode in zip(query_terms, effective_modes):
+    for query_term, term_mode, is_positional_wildcard in zip(
+        query_terms, effective_modes, wildcard_flags
+    ):
         started = time.perf_counter()
+        if is_positional_wildcard:
+            variants_by_term.append({})
+            routes.append("wildcard")
+            fallback_flags.append(False)
+            report.variant_resolution.append(
+                {
+                    "query_term": query_term,
+                    "term_type": "wildcard",
+                    "route": "wildcard",
+                    "variants": 0,
+                    "path": "positional component",
+                    "mode": term_mode,
+                    "mode_detail": "anchor-driven source-position wildcard; no term expansion",
+                    "time_ms": (time.perf_counter() - started) * 1000.0,
+                }
+            )
+            continue
+
         route = classify_query(query_term)
         routes.append(route)
 
@@ -4084,6 +4431,12 @@ def sync_index(
         target[len(term_key[1])].sort()
         new_terms.append((term_key, term_id))
 
+    if any(term_key[0] == "normal" for term_key, _term_id in new_terms):
+        # Incremental synchronization can extend the vocabulary while this
+        # SearchIndex object remains alive. Invalidate the lazy suffix map so
+        # subsequent wildcard lookups also see newly indexed normal terms.
+        index.normal_terms_by_reversed_length.clear()
+
     if new_terms:
         add_rows(
             index.terms,
@@ -4221,6 +4574,7 @@ def search_index(
         flat_term_modes: list[TermSearchMode] = []
         flat_required_wrappers: list[str | None] = []
         flat_canonical_terms: list[str] = []
+        flat_positional_wildcards: list[bool] = []
 
         for slot, query_term in enumerate(query_terms):
             phrase_spec = parse_phrase_query(query_term)
@@ -4246,6 +4600,9 @@ def search_index(
                 flat_term_modes.append(term_modes[slot])
                 flat_required_wrappers.append(component.required_wrapper)
                 flat_canonical_terms.append(canonical_query_term(component.query_term))
+                flat_positional_wildcards.append(
+                    component.wildcard_pattern is not None
+                )
             slot_component_indices.append(component_indices)
 
         # 1. Resolve each indexed component using the existing normal/additional
@@ -4258,6 +4615,7 @@ def search_index(
             config,
             report,
             term_modes=flat_term_modes,
+            positional_wildcards=flat_positional_wildcards,
         )
 
         # 2. Candidate documents must contain every indexed component across
@@ -4374,7 +4732,7 @@ def search_index(
 
         # 5. Build each flattened component's occurrence array.
         match_build_started = time.perf_counter()
-        component_mappings: list[dict[int, MatchArrays]] = []
+        component_mappings: list[dict[int, MatchArrays] | None] = []
         for component_index, (
             query_term,
             route,
@@ -4384,6 +4742,7 @@ def search_index(
             term_mode,
             required_wrapper,
             canonical_term,
+            is_positional_wildcard,
         ) in enumerate(
             zip(
                 flat_query_terms,
@@ -4394,9 +4753,28 @@ def search_index(
                 flat_term_modes,
                 flat_required_wrappers,
                 flat_canonical_terms,
+                flat_positional_wildcards,
             )
         ):
             started = time.perf_counter()
+            if is_positional_wildcard:
+                # Do not materialize a MatchArrays row for every word in the
+                # document. The ordered phrase matcher checks this component
+                # directly from the neighboring anchor coordinate.
+                component_mappings.append(None)
+                report.match_build_by_term.append(
+                    {
+                        "query_term": query_term,
+                        "term_type": "wildcard",
+                        "path": "anchor-driven source-position check",
+                        "route": "wildcard",
+                        "matching_docs": 0,
+                        "occurrences": 0,
+                        "time_ms": (time.perf_counter() - started) * 1000.0,
+                    }
+                )
+                continue
+
             if fallback or not variants:
                 mapping: dict[int, MatchArrays] = {}
                 for doc_id in candidate_docs:
@@ -5486,6 +5864,7 @@ class TextSearchEngine:
                     self.index.normal_terms_by_length,
                     self.index.additional_terms_by_length,
                 ) = load_terms(self.index.terms)
+                self.index.normal_terms_by_reversed_length.clear()
                 (
                     self.index.document_metadata,
                     self.index.doc_word_counts,
@@ -5833,6 +6212,13 @@ def format_time_report(report: SearchReport) -> list[str]:
             f"    - {entry['query_term']!r}: {entry['variants']:,} variant(s), "
             f"{entry['time_ms']:.2f} ms [{entry.get('path', 'n/a')}] {extra}"
         )
+    if report.wildcard_candidate_terms_examined:
+        lines.append(
+            "    - embedded wildcard vocabulary filtering: "
+            f"{report.wildcard_candidate_lookup_ms:.2f} ms "
+            f"({report.wildcard_candidate_terms_examined:,} candidate term(s) examined, "
+            f"{report.wildcard_candidate_terms_matched:,} variant(s) retained)"
+        )
 
     lines.append(
         stage("Term-frequency lookup", report.frequency_ms)
@@ -5891,6 +6277,7 @@ def format_time_report(report: SearchReport) -> list[str]:
         f"  - Positional posting rows fetched: {report.runtime_posting_hits:,} across {report.runtime_posting_lookups:,} term/document probe(s)",
         f"  - Frequency rows fetched: {report.runtime_frequency_hits:,} across {report.runtime_frequency_lookups:,} term/document probe(s)",
         f"  - Fuzzy candidate terms enumerated in memory: {report.runtime_candidate_terms:,}",
+        f"  - Embedded wildcard vocabulary candidates examined: {report.wildcard_candidate_terms_examined:,}",
         f"  - Result source-file reads: {report.runtime_source_file_reads:,}",
         f"  - LanceDB result-document fallbacks: {report.runtime_lancedb_document_fallbacks:,}",
         "",
