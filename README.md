@@ -3,7 +3,7 @@
 No installation required, it is a selfrunning APP - ~200MB<br>
 https://github.com/kalle07/raw-txt-snippet-creator/releases/download/_v03/TextSearch-by-kalle07.exe<br>
 <br>
-📥 Downloads: <!--download-count-->022<!--/download-count-->
+📥 Downloads: <!--download-count-->024<!--/download-count-->
 <br>
 <br>
 
