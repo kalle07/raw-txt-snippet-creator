@@ -119,7 +119,7 @@ As an example from testing, indexing ten large books took approximately
 **5--10 seconds**, loading an existing database took **under one
 second**, and a typical search took **under 100 ms**. These are
 indicative results, not guarantees for every computer or collection.
-Indexing 6000 small text files (~250MB) need aprox 5 min, search is still fast ~100ms.
+Indexing 6000 small text files (~250MB) need aprox 3 min, search is still fast ~200ms.
 
 The first index takes longer because the app must read and process the
 source files. Later launches reuse the local database.
