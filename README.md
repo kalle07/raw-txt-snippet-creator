@@ -43,6 +43,10 @@ Uses the searchable index for fast vocabulary-based searches.
 | `hello wor` | `hello world` | No match |
 | `hello wor*` | `hello world` | Match |
 | `*llo world` | `hello world` | Match |
+| `??llo world` | `hello world` | Match |
+| `* world` | `hello world` and `one world` and `...` | Match |
+
+
 
 Wildcards:
 - `?` matches one character.
