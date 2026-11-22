@@ -135,11 +135,11 @@ Place `start.py`, `gui.py` and `engine.py` in the project folder.
 Designed for large local TXT collections.
 
 Example from testing:
-- Approximately 6,000 TXT files.
+- Approximately 6,000 TXT files (~20E+06 words).
 - Approximately 250 MB of text.
 - Initial indexing: approximately one minute.
 
-Search performance depends on the selected mode, query, file sizes, CPU and storage speed. Database search is generally faster; literal search scans the original files and takes longer.
+Search performance in this case depends on the selected mode, query, file sizes, CPU and storage speed. Database search is generally faster (~100ms); literal search scans the original files and takes longer (max 2000ms).
 
 ## Database compatibility
 
