@@ -3,7 +3,7 @@
 Search large collections of plain-text books and documents from a local desktop application.<br>
 v04 new, much faster indexin, much faster searching, need new index!<br>
 
-**Download:** [TextSearch-by-kalle07.exe (~200 MB)](https://github.com/kalle07/raw-txt-snippet-creator/releases/download/_v03/TextSearch-by-kalle07.exe)
+**Download:** [TextSearch-by-kalle07.exe (~200 MB)](https://github.com/kalle07/raw-txt-snippet-creator/releases/download/_v04/TextSearch-by-kalle07.exe)
 
 📥 Downloads: <!--download-count-->029<!--/download-count-->
 
