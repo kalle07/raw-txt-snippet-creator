@@ -221,12 +221,14 @@ class SearchFrame(wx.Frame):
         self._tree_items_by_path: dict[str, dv.TreeListItem] = {}
         self._tree_check_propagating = False
         self._tree_file_paths: set[str] = set()
+        self._tree_dir_paths: set[str] = set()
         self._search_progress_mode = "regex"
         self._search_reset_timer = None
         self._keyword_fields: list[wx.TextCtrl] = []
         self._regex_search_fields: list[wx.CheckBox] = []
         self._fuzzy_search_fields: list[wx.CheckBox] = []
         self._case_sensitive_fields: list[wx.CheckBox] = []
+        self.literal_text_search: wx.CheckBox | None = None
         self._document_match_counts: dict[str, int] = {}
         # Last completed search state consumed by the modeless Document Browser.
         self._last_search_hits = None
@@ -609,6 +611,26 @@ class SearchFrame(wx.Frame):
             0,
             wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
             18,
+        )
+
+        self.literal_text_search = wx.CheckBox(
+            search_parent,
+            label="Literal text search",
+        )
+        self.literal_text_search.SetValue(False)
+        self.literal_text_search.SetToolTip(
+            "Search the complete source text directly without vocabulary or postings. "
+            "Wildcards and regex characters are treated as ordinary characters."
+        )
+        self.literal_text_search.Bind(
+            wx.EVT_CHECKBOX,
+            self._on_literal_text_search_changed,
+        )
+        control_row.Add(
+            self.literal_text_search,
+            0,
+            wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
+            14,
         )
 
         control_row.Add(
@@ -1015,6 +1037,7 @@ class SearchFrame(wx.Frame):
             self.tree.DeleteAllItems()
             self._tree_items_by_path.clear()
             self._tree_file_paths.clear()
+            self._tree_dir_paths.clear()
             self._indexed_source_paths.clear()
             self._index_needed_paths.clear()
             self._set_index_needed_status_count(0)
@@ -1167,6 +1190,7 @@ class SearchFrame(wx.Frame):
         desired_file_paths = {str(Path(p).absolute()) for p in desired_files}
         desired_dir_sizes = {str(Path(p).absolute()): size for p, size in desired_dirs.items()}
         desired_paths = set(desired_file_paths) | set(desired_dir_sizes)
+        self._tree_dir_paths = set(desired_dir_sizes)
 
         # On the initial pass the visible tree may contain only the loading label.
         if not self._tree_items_by_path:
@@ -1233,6 +1257,7 @@ class SearchFrame(wx.Frame):
         if root_item is not None and root_item.IsOk():
             self.tree.Expand(root_item)
         self.tree.Expand(internal_root)
+        self._update_tree_folder_totals()
 
     def _set_item_path(self, item: dv.TreeListItem, path: Path) -> None:
         """Attach the authoritative filesystem path to a tree item."""
@@ -1565,6 +1590,7 @@ class SearchFrame(wx.Frame):
             match_count = self._document_match_counts.get(path_key, 0)
             self.tree.SetItemText(item, 4, str(match_count) if match_count > 0 else "")
             self._tree_file_paths.add(path_key)
+        self._update_tree_folder_totals()
         return True
 
     def _update_tree_results(self) -> None:
@@ -1579,6 +1605,66 @@ class SearchFrame(wx.Frame):
                 continue
             match_count = self._document_match_counts.get(path_str, 0)
             self.tree.SetItemText(item, 4, str(match_count) if match_count > 0 else "")
+        self._update_tree_folder_totals()
+
+    def _update_tree_folder_totals(self) -> None:
+        """Show recursive word-count and result totals on each folder row.
+
+        Word totals are based on the word counts already displayed for indexed
+        files. Files whose word count is unavailable (for example, not indexed
+        yet) are excluded. Result totals sum the per-file result counts from the
+        most recently completed search.
+        """
+        if self.tree is None or not self._tree_dir_paths:
+            return
+
+        search_root = Path(SEARCH_FOLDER).absolute()
+        word_totals: dict[str, int] = {}
+        folders_with_word_counts: set[str] = set()
+        result_totals: dict[str, int] = {}
+
+        for path_str in self._tree_file_paths:
+            path = Path(path_str).absolute()
+            if path.suffix.casefold() != ".txt" or not self._inside(path, search_root):
+                continue
+
+            item = self._tree_items_by_path.get(path_str)
+            if item is None or not item.IsOk():
+                continue
+
+            try:
+                word_count = int(self.tree.GetItemText(item, 2).replace(",", ""))
+            except (TypeError, ValueError):
+                word_count = None
+            result_count = self._document_match_counts.get(path_str, 0)
+
+            parent = path.parent
+            while self._inside(parent, search_root):
+                parent_key = str(parent)
+                if word_count is not None:
+                    word_totals[parent_key] = word_totals.get(parent_key, 0) + word_count
+                    folders_with_word_counts.add(parent_key)
+                if result_count > 0:
+                    result_totals[parent_key] = (
+                        result_totals.get(parent_key, 0) + result_count
+                    )
+                if parent == search_root:
+                    break
+                parent = parent.parent
+
+        for folder_key in self._tree_dir_paths:
+            item = self._tree_items_by_path.get(folder_key)
+            if item is None or not item.IsOk():
+                continue
+
+            word_count_text = (
+                str(word_totals[folder_key])
+                if folder_key in folders_with_word_counts
+                else "—"
+            )
+            result_count = result_totals.get(folder_key, 0)
+            self.tree.SetItemText(item, 2, word_count_text)
+            self.tree.SetItemText(item, 4, str(result_count) if result_count > 0 else "")
 
 
     def _get_selected_leaf_paths(self) -> set[Path]:
@@ -2586,6 +2672,16 @@ class SearchFrame(wx.Frame):
         self._document_browser.Raise()
         self._document_browser.SetFocus()
 
+    def _on_literal_text_search_changed(self, _event: wx.CommandEvent) -> None:
+        """Disable regex/fuzzy controls while literal text mode is active."""
+        literal_mode = bool(
+            self.literal_text_search is not None
+            and self.literal_text_search.GetValue()
+        )
+        controls_enabled = not literal_mode
+        for checkbox in (*self._regex_search_fields, *self._fuzzy_search_fields):
+            checkbox.Enable(controls_enabled)
+
     def _on_search(self, _event: wx.CommandEvent) -> None:
         raw_terms = [
             self.keyword_1.GetValue(),
@@ -2595,6 +2691,10 @@ class SearchFrame(wx.Frame):
         raw_regex_flags = [checkbox.GetValue() for checkbox in self._regex_search_fields]
         raw_fuzzy_flags = [checkbox.GetValue() for checkbox in self._fuzzy_search_fields]
         raw_case_flags = [checkbox.GetValue() for checkbox in self._case_sensitive_fields]
+        literal_text_search = bool(
+            self.literal_text_search is not None
+            and self.literal_text_search.GetValue()
+        )
 
         terms: list[str] = []
         term_modes: list[str] = []
@@ -2606,19 +2706,23 @@ class SearchFrame(wx.Frame):
             cleaned = term.strip()
             if not cleaned:
                 continue
-            if not regex_enabled and not fuzzy_enabled:
-                wx.MessageBox(
-                    f"Keyword {index}: enable at least one of regex-search or fuzzy-search.",
-                    "Search settings",
-                    wx.OK | wx.ICON_WARNING,
-                )
-                return
-            if regex_enabled and fuzzy_enabled:
-                term_mode = "both"
-            elif regex_enabled:
+            if literal_text_search:
+                # Literal mode ignores regex/fuzzy settings entirely.
                 term_mode = "regex"
             else:
-                term_mode = "fuzzy"
+                if not regex_enabled and not fuzzy_enabled:
+                    wx.MessageBox(
+                        f"Keyword {index}: enable at least one of regex-search or fuzzy-search.",
+                        "Search settings",
+                        wx.OK | wx.ICON_WARNING,
+                    )
+                    return
+                if regex_enabled and fuzzy_enabled:
+                    term_mode = "both"
+                elif regex_enabled:
+                    term_mode = "regex"
+                else:
+                    term_mode = "fuzzy"
             terms.append(cleaned)
             term_modes.append(term_mode)
             case_sensitive.append(bool(sensitive))
@@ -2632,8 +2736,12 @@ class SearchFrame(wx.Frame):
             return
 
         try:
-            fuzzy_distance = self._read_non_negative_int(
-                self.fuzzy_distance, "FUZZY_DISTANCE"
+            fuzzy_distance = (
+                0
+                if literal_text_search
+                else self._read_non_negative_int(
+                    self.fuzzy_distance, "FUZZY_DISTANCE"
+                )
             )
             max_distance_chars = self._read_non_negative_int(
                 self.max_distance_chars, "MAX_DISTANCE_CHARS"
@@ -2650,9 +2758,13 @@ class SearchFrame(wx.Frame):
             return
 
         mode_summary = (
-            term_modes[0]
-            if all(value == term_modes[0] for value in term_modes)
-            else "mixed"
+            "literal"
+            if literal_text_search
+            else (
+                term_modes[0]
+                if all(value == term_modes[0] for value in term_modes)
+                else "mixed"
+            )
         )
         show_time_report = self.timelogs.GetValue()
 
@@ -2667,13 +2779,14 @@ class SearchFrame(wx.Frame):
             )
             return
 
-        # Check for unindexed documents.
+        # Resolve checked physical paths through the engine's in-memory
+        # location metadata. This avoids scanning the complete locations table
+        # on every search and preserves SHA-256 deduplication semantics.
+        selected_doc_ids: set[int] = set()
         if self.engine is not None:
-            indexed_paths = {
-                Path(row["path"]).absolute()
-                for row in self.engine.list_documents()
-            }
-            unindexed = selected_paths - indexed_paths
+            selected_doc_ids, unindexed = self.engine.resolve_paths_to_doc_ids(
+                sorted(selected_paths, key=lambda path: str(path).casefold())
+            )
             if unindexed:
                 wx.MessageBox(
                     "One or more documents selected but not indexed.",
@@ -2732,6 +2845,8 @@ class SearchFrame(wx.Frame):
                 max_results_per_document=max_results_per_document,
                 case_sensitive=case_sensitive,
                 progress_callback=self._queue_search_progress,
+                selected_doc_ids=selected_doc_ids,
+                literal_text_search=literal_text_search,
             )
             self._search_timing["search_engine"] += (
                 time.perf_counter() - engine_start
@@ -2870,6 +2985,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     main()
 
 

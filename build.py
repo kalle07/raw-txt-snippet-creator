@@ -57,6 +57,8 @@ def main() -> None:
         "pyarrow",
         "--hidden-import",
         "rapidfuzz",
+        "--hidden-import",
+        "psutil",
         str(ENTRY_POINT),
     ]
 
