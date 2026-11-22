@@ -44,6 +44,7 @@ Uses the searchable index for fast vocabulary-based searches.
 | `hello wor*` | `hello world` | Match |
 | `*llo world` | `hello world` | Match |
 | `??llo world` | `hello world` | Match |
+| `?llo world` | `hello world` | No Match |
 | `* world` | `hello world` and `one world` and `...` | Match |
 
 
