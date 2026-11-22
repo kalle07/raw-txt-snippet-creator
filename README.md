@@ -1,153 +1,154 @@
-# raw-txt-snippet-creator with database
+# Raw TXT Snippet Creator
 
-No installation required, it is a selfrunning APP - ~200MB<br>
-https://github.com/kalle07/raw-txt-snippet-creator/releases/download/_v03/TextSearch-by-kalle07.exe<br>
-<br>
+Search large collections of plain-text books and documents from a local desktop application.
+
+**Download:** [TextSearch-by-kalle07.exe (~200 MB)](https://github.com/kalle07/raw-txt-snippet-creator/releases/download/_v03/TextSearch-by-kalle07.exe)
+
 📥 Downloads: <!--download-count-->029<!--/download-count-->
-<br>
-<br>
 
-Search large collections of plain-text books and documents from a
-desktop app.
+<img width="2239" height="1259" alt="Raw TXT Snippet Creator screenshot" src="https://github.com/user-attachments/assets/1c323d1e-4588-40e4-a500-ab9fdfb081c5" />
 
+## Features
 
-<img width="2239" height="1259" alt="grafik" src="https://github.com/user-attachments/assets/1c323d1e-4588-40e4-a500-ab9fdfb081c5" />
+- Search up to **three keywords** together (AND).
+- Find passages where keywords occur within a configurable character distance.
+- Extract and merge overlapping snippets.
+- Exact, wildcard, regex and fuzzy search.
+- Case-sensitive search.
+- Separate **Literal text search** mode.
+- Folder-level word counts and search-result counts.
+- Browse results, inspect matching passages and save snippets.
+- Automatically monitor TXT folders for file changes.
 
+Everything runs locally. No embedding model, cloud service or internet connection is required during searching.
 
-Instead of opening files one by one, enter up to **three keywords** and
-find passages where they occur close together. The app extracts readable
-snippets around matches, so you can quickly review relevant passages and
-copy them into your notes or chat.
+## Two independent search modes
 
-It is a lightweight, local text-search approach: it works with ordinary
-`.txt` files and a searchable index rather than requiring an embedding
-model.
+### 1. Database search (default)
 
-## What it does
+Uses the searchable index for fast vocabulary-based searches.
 
--   **Search up to three keywords together.** Keywords are linked with
-    **AND**: a result must satisfy the search terms within the
-    configured character distance.
--   **Find passages, not just hit counts.** The snippet extractor
-    returns context around matching terms.
--   **Merge overlapping snippets.** When extracted sections overlap,
-    they are merged instead of duplicated. The combined output does not
-    exceed the source text length.
--   **Choose your search method for each keyword:**
-    -   **Exact / regex / wildcard search** for precise terms and
-        patterns.
-    -   **Fuzzy search** to find small spelling variations.
-    -   **Case-sensitive search** when capitalization matters.
--   **Phrase search** is supported.
--   **Browse results in the document browser** and use the right-click
-    menu to save snippets.
--   **Monitor your TXT collection while the app is open.** File changes
-    update the GUI tree; use **Index new files** to update the search
-    database.
+- All entered keywords must be found in the same document.
+- Keywords must satisfy the configured maximum character distance.
+- Partial words require wildcards.
+- Supports exact, wildcard, regex and fuzzy matching.
+- Case sensitivity can be configured individually.
 
-## Search tips
+**Examples**
 
-### Distance and context are measured in characters
+| Search | Text in document | Result |
+|---|---|---|
+| `zins` | `Zinssatz` | No match |
+| `zins*` | `Zinssatz` | Match |
+| `hello wor` | `hello world` | No match |
+| `hello wor*` | `hello world` | Match |
+| `*llo world` | `hello world` | Match |
 
--   **`Max_Distance_Chars`** sets the maximum distance between the
-    keywords, in characters.
--   **`Snippet_Context_Chars`** sets how many characters of context to
-    include before and after a match.
+Wildcards:
+- `?` matches one character.
+- `*` matches up to 100 visible characters without crossing whitespace or a line break.
 
-All distances and context values are measured in **characters**, not
-words or tokens. As a rough guide, 4,000 characters are approximately
-1,000 tokens---around one page of a book, depending on formatting and
-language.
+Regex and fuzzy search are available through their respective keyword settings.
 
-### Exact, wildcard and fuzzy search
+An unresolved search term does not automatically trigger a full-text search.
 
-In exact/wildcard mode, a partial word is not automatically treated as a
-prefix. For example, searching for `friend` does not find `friendship`;
-use `friend*` to match a word beginning with `friend`.
+### 2. Literal text search (optional checkbox)
 
--   `?` matches one character.
--   `*` matches up to 100 visible characters without crossing whitespace
-    or a line break.
--   Regex patterns can also be used when regex search is enabled.
+Bypasses vocabulary and postings and searches the original physical TXT files directly.
 
-Fuzzy search is useful for typos and minor spelling differences. A fuzzy
-distance of **1** generally allows one character difference; **2** can
-return many more variations, so use it when broader matching is desired.
+It searches character sequences, partial words and complete phrases.
+
+**Examples**
+
+| Search | Text in document | Result |
+|---|---|---|
+| `hello wor` | `hello world` | Match |
+| `llo world` | `hello world` | Match |
+| `ell worl` | `hello world` | Match |
+| `zins gesetz` | `Basiszinssatz und Gesetz` | Match |
+
+Important:
+- `*` and `?` are ordinary characters, not wildcards.
+- Regex and fuzzy matching are not used.
+- Case-insensitive matching supports English and German letters, including Ä/ä, Ö/ö, Ü/ü and ẞ/ß.
+- `straße` does not match `STRASSE`.
+- New files must be indexed before they are included in searches.
+
+Literal search uses physical CPU cores and parallel batches of 100 files.
+
+## Understanding search results
+
+A result represents a document containing all required keywords within the configured distance.
+
+The output distinguishes:
+
+- **Individual term occurrences:** How often each keyword occurs in the document.
+- **Proximity matches:** How many matching passages were found.
+- **Snippets:** Extracted text surrounding matching passages.
+
+A high occurrence count does not necessarily mean that every occurrence belongs to a valid proximity match. The distance condition determines which passages qualify.
+
+Use the document browser to inspect the complete context, navigate between matches and save useful snippets through the context menu.
+
+## Search settings
+
+All distances are measured in **characters**, not words.
+
+- `Max_Distance_Chars`: Maximum allowed distance between search terms.
+- `Snippet_Context_Chars`: Amount of text shown before and after a match.
+- `Max documents`: Maximum number of returned documents.
+- `Max results per document`: Limits matching passages per document.
 
 ## Getting started
 
-### Using the EXE
+### Windows EXE
 
-1.  Copy the EXE file into a folder of your choice.
-2.  Run it. On first launch, the app creates the local database
-    (`text_search.lancedb`) and the `txt` folder if they do not already
-    exist.
-3.  Copy `.txt` files into `txt`, or choose text files through the app.
-    Subfolders inside `txt` are supported.
-4.  Click **Index new files** to add new files or update changed files.
-5.  Enter one, two or three keywords, configure the distance and
-    context, and search.
+1. Download and run the EXE.
+2. On first launch, the application creates `text_search.lancedb` and the `txt` folder.
+3. Copy your `.txt` files into `txt`. Subfolders are supported.
+4. Click **Index new files**.
+5. Enter your keywords and search.
 
-The `deleted` folder is located next to `txt`, not inside it. The app
-searches `.txt` files throughout `txt` and its subfolders.
+The `deleted` folder is located next to `txt`, not inside it.
 
-### Running from Python
+### Run from Python
 
-If you are running the source code instead of the packaged EXE, place
-`gui.py` and `engine.py` in the same folder, then install the
-dependencies:
+Python 3.11 or newer is recommended.
 
-``` bash
-<folder of your choice>
+```bash
 python -m venv venv
-venv\Scripts\activate # On Windows
+venv\Scripts\activate
 pip install -r requirements.txt
 python start.py
 ```
 
-Python 3.11 or newer is recommended. wxPython installation on Linux may
-require system GTK/wxWidgets libraries.
+Place `start.py`, `gui.py` and `engine.py` in the project folder.
 
-## Performance and collection size
+## Performance
 
-The app is designed for large local TXT collections. In testing, it has
-been used with large book-sized text files and collections of many
-files. Actual indexing and search times depend on file sizes, storage
-speed, CPU and search settings.
+Designed for large local TXT collections.
 
-As an example from testing, indexing ten large books (~15MB) took approximately
-**5--10 seconds**, loading an existing database took **under one
-second**, and a typical search took **under 100 ms**. These are
-indicative results, not guarantees for every computer or collection.
-Indexing 6000 small text files (~250MB) need aprox 1 min, search is still fast ~200ms.
+Example from testing:
+- Approximately 6,000 TXT files.
+- Approximately 250 MB of text.
+- Initial indexing: approximately one minute.
 
-The first index takes longer because the app must read and process the
-source files. Later launches reuse the local database.
+Search performance depends on the selected mode, query, file sizes, CPU and storage speed. Database search is generally faster; literal search scans the original files and takes longer.
 
-## Important: database compatibility
+## Database compatibility
 
-A new app version may change the index format. **There is no guaranteed
-backward compatibility between versions.** When upgrading to a version
-that changes the index, close the app and delete the
-`text_search.lancedb` folder to let the app create a fresh database.
-This requires indexing the TXT collection again. Keep a backup if you
-need to preserve the old index.
+Index formats may change between versions. When upgrading to an incompatible version, close the application and delete `text_search.lancedb`. The database will be recreated and the TXT collection must be indexed again.
 
-## Recommended companion tool
+Keep a backup if you need the previous index.
 
-For converting PDFs to TXT before searching, see [PDF
-Parser](https://github.com/kalle07/pdf2txt-parser).
+## Related project
+
+For converting PDFs into searchable TXT files, see [PDF Parser](https://github.com/kalle07/pdf2txt-parser).
 
 ## Notes
 
--   Windows is the only platform tested so far.
--   The app searches plain `.txt` files; PDFs must be converted to text
-    first.
--   You can copy and paste the extracted passages into your chat, notes
-    or other tools.
+- Windows is the only platform tested.
+- Only plain `.txt` files are searched. Convert PDFs first.
+- All searching is performed locally.
 
-<br>
-
-
-<br>
-I am not responsible for any errors or crashes on your system. If you use it, you take full responsibility!
+**Disclaimer:** Use this software at your own responsibility. I am not responsible for errors, data loss or system problems.
