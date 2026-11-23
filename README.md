@@ -88,7 +88,7 @@ Important:
 
 ## Understanding search results
 
-A result represents a document containing all required keywords within the configured distance.<br>
+A result represents a document containing all required keywords within the configured distance as chain.<br>
 Example: <br>
 Keyword-1: "hello"<br>
 Keyword-2: "world"<br>
