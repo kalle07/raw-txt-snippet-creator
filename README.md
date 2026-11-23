@@ -35,7 +35,7 @@ Uses the searchable index for fast vocabulary-based searches.
 - Supports exact, wildcard, regex and fuzzy matching.
 - Case sensitivity can be configured individually.
 
-**Examples**
+**Examples** for one Keyword (Phrase)
 
 | Search | Text in document | Result |
 |---|---|---|
@@ -47,7 +47,7 @@ Uses the searchable index for fast vocabulary-based searches.
 | `??llo world` | `hello world` | Match |
 | `?llo world` | `hello world` | No Match |
 | `* world` | `hello world` and `one world` and `...` | Match |
-
+The second and third keyword must satisfy the maximum distance!
 
 
 Wildcards:
@@ -64,23 +64,21 @@ Bypasses vocabulary and postings and searches the original physical TXT files di
 
 It searches character sequences, partial words and complete phrases.
 
-**Examples**
+**Examples** for one Keyword (Phrase)
 
 | Search | Text in document | Result |
 |---|---|---|
 | `hello wor` | `hello world` | Match |
 | `llo world` | `hello world` | Match |
 | `ell worl` | `hello world` | Match |
-| `zins gesetz` | `Basiszinssatz und Gesetz` | Match |
+| `zinssatz, gesetz` | `Basiszinssatz, Gesetz` | Match |
+The second and third keyword must satisfy the maximum distance!
 
 Important:
 - `*` and `?` are ordinary characters, not wildcards.
-- Regex and fuzzy matching are not used.
 - Case-insensitive matching supports English and German letters, including Ä/ä, Ö/ö, Ü/ü and ẞ/ß.
-- `straße` does not match `STRASSE`.
 - New files must be indexed before they are included in searches.
 
-Literal search uses physical CPU cores and parallel batches of 100 files.
 
 ## Understanding search results
 
@@ -94,7 +92,7 @@ The output distinguishes:
 
 A high occurrence count does not necessarily mean that every occurrence belongs to a valid proximity match. The distance condition determines which passages qualify.
 
-Use the document browser to inspect the complete context, navigate between matches and save useful snippets through the context menu.
+=> Use the **document browser** to inspect the complete context, navigate between matches and save useful snippets through the context menu.
 
 ## Search settings
 
