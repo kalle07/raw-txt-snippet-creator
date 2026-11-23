@@ -47,6 +47,7 @@ Uses the searchable index for fast vocabulary-based searches.
 | `??llo world` | `hello world` | Match |
 | `?llo world` | `hello world` | No Match |
 | `* world` | `hello world` and `one world` and `...` | Match |
+<br>
 The second and third keyword must satisfy the maximum distance!
 
 
@@ -72,6 +73,7 @@ It searches character sequences, partial words and complete phrases.
 | `llo world` | `hello world` | Match |
 | `ell worl` | `hello world` | Match |
 | `zinssatz, gesetz` | `Basiszinssatz, Gesetz` | Match |
+<br>
 The second and third keyword must satisfy the maximum distance!
 
 Important:
