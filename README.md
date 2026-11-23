@@ -89,12 +89,12 @@ Important:
 ## Understanding search results
 
 A result represents a document containing all required keywords within the configured distance.<br>
-Example: 
-Keyword-1: "hello"
-Keyword-2: "world"
-Keyword-2: "peace"
-max_distance=500
-snippet_context=200
+Example: <br>
+Keyword-1: "hello"<br>
+Keyword-2: "world"<br>
+Keyword-2: "peace"<br>
+max_distance=500<br>
+snippet_context=200<br>
 Result: "200 chars ... "Keyword-2" (max 500 chars) "Keyword-1" (max 500 chars) "Keyword-2" (max 500 chars) "Keyword-3" (max 500 chars) "Keyword-1" ... 200 chars"<b>
 you see alternating keywords in a chain, the chain breacks if within 500 chars the keyword not altering (all keywords must altering). The chain is not extended if, for example, keyword 1 appears more than once, for example the chain is not extended if only keyword-1 and 2 is altering. oc you can search the same word as keyword-1 and 2 you will find "hello (max 500 chars) hello".
 
