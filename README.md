@@ -32,7 +32,10 @@ Uses the searchable index for fast vocabulary-based searches.
 - All entered keywords must be found in the same document.
 - Keywords must satisfy the configured maximum character distance.
 - Partial words require wildcards.
-- Supports exact, wildcard, regex and fuzzy matching.
+- Supports exact, wildcard, regex and fuzzy matching. <br>
+(fuzzy-distance=1 means: search with change or add or remove one character)<br>
+Example "hello" - found matches - "hello", "ello", "helloo", "hella", ... 
+
 - Case sensitivity can be configured individually.
 
 **Examples** for one Keyword (Phrase)
@@ -69,6 +72,7 @@ It searches character sequences, partial words and complete phrases.
 
 | Search | Text in document | Result |
 |---|---|---|
+| `ell` | `hello` and `hell` and `sell` ...| Match |
 | `hello wor` | `hello world` | Match |
 | `llo world` | `hello world` | Match |
 | `ell worl` | `hello world` | Match |
