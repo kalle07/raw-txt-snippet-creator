@@ -135,13 +135,14 @@ The `deleted` folder is located next to `txt`, not inside it.
 Python 3.11 or newer is recommended.
 
 ```bash
+*chose your folder*
+git clone https://github.com/kalle07/raw-txt-snippet-creator
 python -m venv venv
-venv\Scripts\activate
+venv\Scripts\activate.bat
 pip install -r requirements.txt
 python start.py
 ```
 
-Place `start.py`, `gui.py` and `engine.py` in the project folder.
 
 ## Performance
 
