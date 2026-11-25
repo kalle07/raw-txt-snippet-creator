@@ -4,6 +4,7 @@ Search large collections of plain-text books and documents from a local desktop 
 v04 new, much faster indexing, much faster searching, need new index!<br>
 
 **Download:** [TextSearch-by-kalle07.exe (~200 MB)](https://github.com/kalle07/raw-txt-snippet-creator/releases/download/_v04/TextSearch-by-kalle07.exe)
+Copy the EXE file to a folder of your choice, run the programme once and add TXT files, or create a TXT folder next to the EXE file and copy the files there – including subfolders, if you wish.<br>
 
 📥 Downloads: <!--download-count-->033<!--/download-count-->
 
