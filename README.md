@@ -97,7 +97,8 @@ Keyword-3: "peace"<br>
 max_distance = 500<br>
 snippet_context = 200 (Number of characters before and after the snippet)<br>
 Result: <br>
-"<b>`200 chars ... "Keyword-2" (max 500 chars) "Keyword-1" ((Keyword-1)max 500 chars) "Keyword-2" (max 500 chars) "Keyword-3" ((Keyword-3) max 500 chars) "Keyword-1" ... 200 chars`</b>"<br>
+
+"<b>`200 chars (within 500 chars no Keyword-1 or 3 found)... "Keyword-2" (max 500 chars) "Keyword-1" ((Keyword-1)max 500 chars) "Keyword-2" (max 500 chars) "Keyword-3" ((Keyword-3) max 500 chars) "Keyword-1" ... 200 chars (within 500 chars no Keyword-2 or 3 found)`</b>"<br>
 You see alternating keywords in a chain, the chain is truncated if within 500 chars the keyword not altering (all keywords must altering). The chain is not extended if, for example: only keyword 1 appears within 500 chars, for example: the chain is not extended if only keyword-1 and 2 is altering. oc you can search the same word "hello" as keyword-1 and 2 you will find "... hello (max 500 chars) hello (max 500 chars) hello ...".
 
 The output distinguishes:
